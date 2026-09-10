@@ -158,8 +158,8 @@ table.eng-table tbody tr:last-child td { border-bottom: none; }
 .cand-cell .name { font-weight: 600; }
 .cand-cell .sub { display: block; font-size: 12px; color: var(--ink-faint); font-weight: 400; }
 .owner-cell { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--ink-muted); }
-.fee-cell { font-family: "IBM Plex Mono", monospace; }
-.idle-cell { font-family: "IBM Plex Mono", monospace; color: var(--ink-muted); }
+.fee-cell { font-family: "IBM Plex Mono", monospace; font-variant-numeric: tabular-nums; }
+.idle-cell { font-family: "IBM Plex Mono", monospace; font-variant-numeric: tabular-nums; color: var(--ink-muted); }
 .idle-cell.hot { color: var(--rust); }
 .overflow-x { overflow-x: auto; }
 

@@ -27,6 +27,19 @@ function stageLabel(stage: string): string {
   return stage.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+// Must mirror getPipelineKpis()'s own "stalled" definition (src/engagements/
+// queries.ts): sitting in 'placed' or 'secured' for a long time is the
+// normal, good outcome, not a problem. Without this check a row in one of
+// those stages sits at row.daysInStage >= threshold just because a
+// placement has been secured for months, and gets flagged in the same
+// alarming rust-red idle-cell as a genuinely stalled search -- directly
+// contradicting the "Stalled" KPI tile above the table, which already
+// excludes them.
+const TERMINAL_STAGES = new Set(["placed", "secured"]);
+function isStalled(stage: string, daysInStage: number): boolean {
+  return daysInStage >= STALE_DAYS_THRESHOLD && !TERMINAL_STAGES.has(stage);
+}
+
 function initials(name: string): string {
   return name.split(" ").map((p) => p[0]).join("").slice(0, 2).toUpperCase();
 }
@@ -109,7 +122,7 @@ export default async function DashboardPage() {
                         {row.ownerName ?? "unassigned"}
                       </div>
                     </td>
-                    <td className={`idle-cell${row.daysInStage >= STALE_DAYS_THRESHOLD ? " hot" : ""}`}>{row.daysInStage}d</td>
+                    <td className={`idle-cell${isStalled(row.currentStage, row.daysInStage) ? " hot" : ""}`}>{row.daysInStage}d</td>
                     <td className="fee-cell">{row.expectedFee ? `$${row.expectedFee.toLocaleString()}` : "—"}</td>
                   </tr>
                 ))}
