@@ -1,12 +1,19 @@
-import { portalSignIn } from "./actions";
+import { requestMagicLinkAction } from "./actions";
 
-// Client portal sign-in. Deliberately separate from /sign-in (internal
-// app) -- see src/portal/session.ts for why these are two identity spaces,
-// and its SECURITY NOTE before treating this as production-ready.
-export default function PortalSignInPage() {
+// Client portal sign-in -- passwordless magic link (src/portal/auth.ts).
+// Replaces the old plain-email dev cookie entirely; see that file's
+// header comment for what's real here (the whole token/session
+// lifecycle) versus what isn't (actual email delivery -- no provider is
+// configured in this sandbox, so the link is logged server-side and, in
+// dev only, shown directly below).
+export default function PortalSignInPage({
+  searchParams,
+}: {
+  searchParams: { sent?: string; devLink?: string; error?: string };
+}) {
   return (
     <main style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
-      <div className="card" style={{ maxWidth: 400, width: "100%", padding: 32 }}>
+      <div className="card" style={{ maxWidth: 420, width: "100%", padding: 32 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 24 }}>
           <div
             style={{
@@ -31,20 +38,43 @@ export default function PortalSignInPage() {
           </div>
         </div>
 
-        <form action={portalSignIn}>
-          <label htmlFor="portal-email" style={{ display: "block", fontSize: 12.5, color: "var(--ink-muted)", marginBottom: 6 }}>
-            Email
-          </label>
-          <input id="portal-email" name="email" type="email" placeholder="you@yourbrokerage.com" required className="field" />
-          <button type="submit" className="btn btn-primary" style={{ marginTop: 14, width: "100%", justifyContent: "center" }}>
-            Sign In
-          </button>
-        </form>
+        {searchParams.error && (
+          <div className="pill pill-rust" style={{ marginBottom: 16 }}>
+            {searchParams.error === "invalid_or_expired" ? "That link has expired or was already used." : "Something went wrong."}
+          </div>
+        )}
 
-        <p style={{ fontSize: 11.5, color: "var(--ink-faint)", marginTop: 20, lineHeight: 1.5 }}>
-          Demo sign-in — enter the email address Palladium Point set up for your account. A real deploy replaces this with a
-          verified sign-in link.
-        </p>
+        {searchParams.sent ? (
+          <div>
+            <p style={{ fontSize: 14, color: "var(--ink-muted)", lineHeight: 1.6 }}>
+              If that email has portal access, a sign-in link is on its way. Check your inbox — the link expires in 15 minutes.
+            </p>
+            {searchParams.devLink && (
+              <div style={{ marginTop: 16, padding: 14, background: "var(--surface-sunk)", borderRadius: 4 }}>
+                <p style={{ fontSize: 11.5, color: "var(--ink-faint)", margin: "0 0 8px" }}>
+                  DEV ONLY — no email provider is configured in this environment (see src/portal/emailSender.ts). This link would
+                  normally only exist in the email:
+                </p>
+                <a href={searchParams.devLink} className="btn btn-primary" style={{ wordBreak: "break-all", fontSize: 11 }}>
+                  {searchParams.devLink}
+                </a>
+              </div>
+            )}
+            <a href="/portal/sign-in" style={{ display: "block", marginTop: 16, fontSize: 13, color: "var(--ink-faint)" }}>
+              ← Try a different email
+            </a>
+          </div>
+        ) : (
+          <form action={requestMagicLinkAction}>
+            <label htmlFor="portal-email" style={{ display: "block", fontSize: 12.5, color: "var(--ink-muted)", marginBottom: 6 }}>
+              Email
+            </label>
+            <input id="portal-email" name="email" type="email" placeholder="you@yourbrokerage.com" required className="field" />
+            <button type="submit" className="btn btn-primary" style={{ marginTop: 14, width: "100%", justifyContent: "center" }}>
+              Send Sign-In Link
+            </button>
+          </form>
+        )}
       </div>
     </main>
   );

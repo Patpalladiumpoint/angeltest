@@ -67,20 +67,42 @@ must set it up that way and periodically confirm it hasn't drifted.
 Eliminated by: nothing in-app can verify "this is actually a separate
 account" -- it's an infrastructure/ops discipline, not a code guarantee.
 
-## 5. Client portal auth is not production-safe yet
+## 5. Client portal: email delivery has no real provider configured
 
-`src/portal/session.ts` and `/portal/sign-in` accept any email that matches
-an active `client_contact` row, with **no verification step at all** -- not
-even the internal app's dev-sign-in has this gap, since the internal app's
-production path is real Supabase Auth Google SSO. Before any real client is
-given a portal URL: wire Supabase Auth magic-link (or another verified
-channel) to `client_contact.email`, and remove the plain-email sign-in
-path entirely rather than just gating it tighter.
+**Update:** the release blocker this section used to describe (plain-email
+sign-in, no verification step at all) is fixed. `src/portal/auth.ts` now
+implements real passwordless magic-link auth: a random 32-byte token,
+only its SHA-256 hash ever stored (`portal_magic_link`/`portal_session`,
+migration 0015), single-use and 15-minute-expiring links, revocable
+7-day sessions. Every guarantee (unused-and-unexpired lookup succeeds,
+second redemption of the same token fails, an expired link is rejected,
+a revoked session stops authenticating) was verified directly against
+Postgres, simulating the app role's exact queries, in the session that
+built it.
 
-Eliminated by: replacing `src/app/portal/sign-in/actions.ts`'s
-`portalSignIn` with a real verified-auth flow. Nothing else in the portal
-(the client-side data scoping, the money-column lockdown) needs to change
-when that happens -- see `src/portal/queries.ts`'s header comment.
+**What's still manual:** there is no real email provider configured in
+this environment (no SMTP/API credentials available to wire one). Today,
+`src/portal/emailSender.ts`'s `ConsoleEmailSender` only logs the magic
+link server-side, and outside production the sign-in page also renders
+the link directly in the response (clearly marked "DEV ONLY") so the flow
+is clickable without a mail server. Before any real client is given a
+portal URL:
+
+1. Pick a transactional email provider (Resend is the most direct fit for
+   a Next.js/Vercel stack -- see `src/portal/emailSender.ts`'s header
+   comment for the exact steps).
+2. Set its API key in the environment.
+3. Replace `ConsoleEmailSender` with a real implementation of the
+   `EmailSender` interface -- everything that calls it is already
+   provider-agnostic.
+4. Remove the dev-link rendering in `src/app/portal/sign-in/page.tsx` and
+   `actions.ts` (both are clearly commented for exactly this).
+5. Send and click one real magic-link email end to end before calling
+   this production-ready -- it is not, until that happens at least once
+   against a live provider.
+
+Eliminated by: step 3 above -- the token/session lifecycle underneath it
+needs no further changes.
 
 ## 6. `app_user` provisioning is manual, not self-serve
 

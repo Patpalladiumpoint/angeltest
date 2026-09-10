@@ -30,11 +30,19 @@ build; see "A note on this session's constraints"):
   was proven, directly against Postgres in this session, to fail with
   `permission denied` -- the column-level lockdown from migration `0007`
   protects any actor asking through `palladium_app`, portal included.
-  **Read `src/portal/session.ts`'s SECURITY NOTE before this goes near a
-  real client**: sign-in is unverified email entry, dev/demo-only, with no
-  production fallback yet (unlike the internal app's Supabase Auth path).
-  Seed a demo contact with `npm run portal:seed-demo-contact` after running
-  the narrow importer.
+  **Auth is now real passwordless magic-link** (`src/portal/auth.ts`,
+  migration `0015`): a random 32-byte token, only its SHA-256 hash ever
+  stored, single-use, 15-minute expiry, revocable 7-day sessions. Every
+  guarantee was verified directly against Postgres as the `palladium_app`
+  role -- an unused/unexpired link redeems, a second redemption of the
+  same token fails, an expired link is rejected, a revoked session stops
+  authenticating. The one piece that's genuinely not production-ready:
+  there's no real email provider wired (`src/portal/emailSender.ts` just
+  logs the link server-side; outside production the sign-in page also
+  shows it directly, clearly marked "DEV ONLY") -- see
+  `docs/manual-steps.md` #5 for the exact steps to wire one. Seed a demo
+  contact with `npm run portal:seed-demo-contact` after running the
+  narrow importer.
 
 ## Why this repo looks like a restart
 
