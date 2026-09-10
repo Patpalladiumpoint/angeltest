@@ -12,7 +12,8 @@ export type NavKey =
   | "scorecards"
   | "data-quality"
   | "cadence"
-  | "playbooks";
+  | "playbooks"
+  | "search"; // not in the sidebar -- reached via the topbar search box
 
 // Sidebar + topbar shell for the internal Palladium OS app (not the client
 // portal, which is deliberately lighter -- see src/app/portal/layout.tsx).
@@ -91,6 +92,9 @@ export function AppShell({
       <div className="os-main">
         <div className="os-topbar">
           <h1>{pageTitle}</h1>
+          <form action="/search" style={{ flex: 1, maxWidth: 360, margin: "0 16px" }}>
+            <input className="field" name="q" placeholder="Search candidates, clients, opportunities…" style={{ width: "100%" }} />
+          </form>
           <div className="os-topbar-actions">{actions}</div>
         </div>
         <div className="os-body">{children}</div>

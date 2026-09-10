@@ -19,7 +19,7 @@ const queryClient = postgres(connectionString, { max: 10 });
 export const db = drizzle(queryClient, { schema });
 export { queryClient };
 
-export type Actor = { userId: string; role: "recruiter" | "ops" | "exec" };
+export type Actor = { userId: string; role: "recruiter" | "ops" | "exec" | "admin" };
 
 // First parameter type of db.transaction()'s callback -- pulled from the
 // live `db` instance rather than hand-typed against drizzle-orm's internal

@@ -15,7 +15,7 @@ export default async function DataQualityPage() {
   if (!actor) redirect("/sign-in");
 
   const [me] = await db.select({ name: appUser.name }).from(appUser).where(eq(appUser.id, actor.userId)).limit(1);
-  const [report, mergeCandidates] = await Promise.all([runDataQualityReport(), listPendingMergeCandidates()]);
+  const [report, mergeCandidates] = await Promise.all([runDataQualityReport(actor), listPendingMergeCandidates()]);
 
   return (
     <AppShell
@@ -49,6 +49,18 @@ export default async function DataQualityPage() {
         ))}
       </Panel>
 
+      <Panel title="Probable Duplicate Companies" count={report.duplicateBrokerages.length}>
+        {report.duplicateBrokerages.map((r) => (
+          <div className="list-row" key={`${r.brokerageAId}-${r.brokerageBId}`}>
+            <div className="l-main">
+              <span>{r.brokerageAName} ↔ {r.brokerageBName}</span>
+              <span className="t">similarity {r.similarity.toFixed(3)} · not auto-merged, review manually</span>
+            </div>
+            <span className="pill pill-amber">Review</span>
+          </div>
+        ))}
+      </Panel>
+
       <Panel title="Engagements With No Owner" count={report.ownerlessEngagements.length}>
         {report.ownerlessEngagements.map((r) => (
           <div className="list-row" key={r.engagementId}>
@@ -57,6 +69,42 @@ export default async function DataQualityPage() {
               <span className="t">{r.jobTitle}</span>
             </div>
             <span className="pill pill-slate">{r.stage.replace(/_/g, " ")}</span>
+          </div>
+        ))}
+      </Panel>
+
+      <Panel title="Engagements With No Next Action" count={report.missingNextAction.length}>
+        {report.missingNextAction.map((r) => (
+          <div className="list-row" key={r.engagementId}>
+            <div className="l-main">
+              <span>{r.personName} — {r.jobTitle}</span>
+              <span className="t">{r.ownerName ?? "unowned"}</span>
+            </div>
+            <span className="pill pill-slate">{r.stage.replace(/_/g, " ")}</span>
+          </div>
+        ))}
+      </Panel>
+
+      <Panel title="Impossible Stage/Date Combinations" count={report.impossibleDateCombinations.length}>
+        {report.impossibleDateCombinations.map((r) => (
+          <div className="list-row" key={r.entityId}>
+            <div className="l-main">
+              <span>{r.personName}</span>
+              <span className="t">{r.detail}</span>
+            </div>
+            <span className="pill pill-rust">{r.kind}</span>
+          </div>
+        ))}
+      </Panel>
+
+      <Panel title="Inactive Clients With Active Portal Contacts" count={report.inactiveClientActiveContacts.length}>
+        {report.inactiveClientActiveContacts.map((r) => (
+          <div className="list-row" key={r.contactId}>
+            <div className="l-main">
+              <span>{r.contactName} — {r.contactEmail}</span>
+              <span className="t">{r.brokerageName}</span>
+            </div>
+            <a className="btn" style={{ padding: "6px 11px" }} href={`/clients/${r.clientId}`}>Review</a>
           </div>
         ))}
       </Panel>
