@@ -100,17 +100,31 @@ export async function runDataQualityReport(actor: Actor): Promise<DataQualityRep
     FROM engagement e
     JOIN person p ON p.id = e.person_id
     JOIN job j ON j.id = e.job_id
+    -- Unlike stalledEngagements/missingNextAction below, this deliberately
+    -- does NOT use is_open_engagement_stage() -- an ownerless *secured*
+    -- placement is arguably the worst case to miss (nobody attributed for
+    -- commission), so placed/secured stay in scope here. Only genuinely
+    -- dead (closed-lost) or parked (nurture) engagements are excluded;
+    -- nobody needs to be assigned to "own" following up on those.
     WHERE e.owner_user_id IS NULL AND e.status = 'active'
+      AND e.current_stage NOT IN (
+        'candidate_declined', 'client_rejected', 'palladium_reject', 'withdrawn', 'fell_off',
+        'not_interested', 'future_prospect', 'keep_in_touch', 'nurture'
+      )
     ORDER BY e.created_at ASC
   `);
 
-  // "Missing next action" (section 17): an active engagement with no
-  // next_action_due_at AND no open task pointed at it has fallen out of
-  // every mechanism (the auto-task rules in src/domain/transitions.ts, and
-  // manual task creation) that would otherwise keep it moving -- distinct
-  // from stalledEngagements below, which flags engagements that HAVE been
-  // sitting idle a long time regardless of whether a next action exists.
-  // This flags the earlier failure mode: nobody ever set one.
+  // "Missing next action" (section 17): an active, still-open engagement
+  // with no next_action_due_at AND no open task pointed at it has fallen
+  // out of every mechanism (the auto-task rules in
+  // src/domain/transitions.ts, and manual task creation) that would
+  // otherwise keep it moving -- distinct from stalledEngagements below,
+  // which flags engagements that HAVE been sitting idle a long time
+  // regardless of whether a next action exists. This flags the earlier
+  // failure mode: nobody ever set one. Scoped to is_open_engagement_stage()
+  // (migration 0018) the same way stalledEngagements is -- a closed-lost or
+  // nurture engagement genuinely has no next action, and that's correct,
+  // not a gap to flag.
   const missingNextAction = await db.execute<{
     engagement_id: string;
     person_name: string;
@@ -124,6 +138,7 @@ export async function runDataQualityReport(actor: Actor): Promise<DataQualityRep
     JOIN job j ON j.id = e.job_id
     LEFT JOIN app_user u ON u.id = e.owner_user_id
     WHERE e.status = 'active'
+      AND is_open_engagement_stage(e.current_stage)
       AND e.next_action_due_at IS NULL
       AND NOT EXISTS (SELECT 1 FROM task t WHERE t.engagement_id = e.id AND t.completed_at IS NULL)
     ORDER BY e.created_at ASC
@@ -215,7 +230,10 @@ export async function runDataQualityReport(actor: Actor): Promise<DataQualityRep
   // idle x expected fee) surfaces the engagements where both staleness and
   // dollar value are high, rather than sorting on either alone -- a
   // $200k search idle for 3 days and a $5k search idle for 90 days
-  // shouldn't rank above a $150k search idle for 45 days.
+  // shouldn't rank above a $150k search idle for 45 days. Excludes every
+  // closed stage (won, lost, or nurture) via is_open_engagement_stage()
+  // (migration 0018), not just placed/secured -- a client-rejected search
+  // sitting untouched for 90 days isn't "stalled," it's finished.
   const stalledEngagements = await db.execute<{
     engagement_id: string;
     person_name: string;
@@ -237,7 +255,7 @@ export async function runDataQualityReport(actor: Actor): Promise<DataQualityRep
     JOIN person p ON p.id = e.person_id
     JOIN job j ON j.id = e.job_id
     WHERE e.status = 'active'
-      AND e.current_stage NOT IN ('placed', 'secured')
+      AND is_open_engagement_stage(e.current_stage)
     ORDER BY risk_score DESC
     LIMIT 50
   `);

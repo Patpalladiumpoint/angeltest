@@ -92,12 +92,18 @@ export async function getPipelineKpis(): Promise<PipelineKpis> {
     placements_mtd_fee: number;
   }>(sql`
     SELECT
-      (SELECT count(*)::int FROM engagement WHERE status = 'active') AS active_engagements,
+      -- "Across every open search" (the tile's own sub-label): a
+      -- closed-lost or nurture engagement isn't an open search any more
+      -- than a placed/secured one is, so this uses the same open-stage
+      -- classification as stalled_count/revenue_at_risk below rather
+      -- than just filtering on status (which nothing currently sets to
+      -- 'closed' -- see docs/mvp-status.md).
+      (SELECT count(*)::int FROM engagement WHERE status = 'active' AND is_open_engagement_stage(current_stage)) AS active_engagements,
       (SELECT count(*)::int FROM engagement
-        WHERE status = 'active' AND current_stage NOT IN ('placed','secured')
+        WHERE status = 'active' AND is_open_engagement_stage(current_stage)
           AND stage_entered_at < now() - make_interval(days => ${STALE_DAYS_THRESHOLD})) AS stalled_count,
       (SELECT coalesce(sum(expected_fee), 0) FROM engagement
-        WHERE status = 'active' AND current_stage NOT IN ('placed','secured')
+        WHERE status = 'active' AND is_open_engagement_stage(current_stage)
           AND stage_entered_at < now() - make_interval(days => ${STALE_DAYS_THRESHOLD})) AS revenue_at_risk,
       (SELECT count(*)::int FROM person_merge_candidate WHERE status = 'pending') AS pending_merges,
       (SELECT count(*)::int FROM placement WHERE start_date >= date_trunc('month', now())) AS placements_mtd,

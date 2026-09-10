@@ -8,6 +8,7 @@ import { listActiveEngagements, getPipelineKpis, STALE_DAYS_THRESHOLD } from "@/
 import { listOverdueTasks } from "@/tasks/queries";
 import { listInterviewsToday } from "@/interviews/queries";
 import { getArSummary } from "@/finance/queries";
+import { OPEN_STAGES } from "@/domain/stages";
 
 const STAGE_PILL: Record<string, string> = {
   sourced: "pill-slate",
@@ -31,16 +32,21 @@ function stageLabel(stage: string): string {
 }
 
 // Must mirror getPipelineKpis()'s own "stalled" definition (src/engagements/
-// queries.ts): sitting in 'placed' or 'secured' for a long time is the
-// normal, good outcome, not a problem. Without this check a row in one of
-// those stages sits at row.daysInStage >= threshold just because a
-// placement has been secured for months, and gets flagged in the same
-// alarming rust-red idle-cell as a genuinely stalled search -- directly
-// contradicting the "Stalled" KPI tile above the table, which already
-// excludes them.
-const TERMINAL_STAGES = new Set(["placed", "secured"]);
+// queries.ts, is_open_engagement_stage() in migration 0018): sitting in a
+// closed-won stage (placed/secured), a closed-lost stage, or a nurture
+// stage for a long time is normal, not a problem -- only a still-open
+// pipeline stage sitting idle is a real stall. Without this check a row in
+// any of those stages sits at row.daysInStage >= threshold just because
+// it's been closed (won OR lost) or parked for months, and gets flagged in
+// the same alarming rust-red idle-cell as a genuinely stalled search --
+// directly contradicting the "Stalled" KPI tile above the table, which
+// already excludes them. Reuses OPEN_STAGES (src/domain/stages.ts) rather
+// than a locally redeclared stage set, so this can't drift from the SQL
+// side's is_open_engagement_stage() the way the placed/secured-only
+// version of this check had already drifted from closed-lost/nurture.
+const OPEN_STAGE_SET: ReadonlySet<string> = new Set(OPEN_STAGES);
 function isStalled(stage: string, daysInStage: number): boolean {
-  return daysInStage >= STALE_DAYS_THRESHOLD && !TERMINAL_STAGES.has(stage);
+  return daysInStage >= STALE_DAYS_THRESHOLD && OPEN_STAGE_SET.has(stage);
 }
 
 function initials(name: string): string {

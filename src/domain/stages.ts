@@ -62,6 +62,11 @@ export const OPEN_STAGES: EngagementStage[] = (Object.keys(STAGE_INFO) as Engage
   (s) => !TERMINAL_STAGES.has(s) && !CLOSED_LOST_STAGES.has(s) && !NURTURE_STAGES.has(s),
 );
 
+// Mirrored in Postgres as is_open_engagement_stage() (migration 0018) for
+// the raw-SQL queries (Pipeline KPIs, DCT, Data Quality) that can't import
+// this TS module -- keep both lists in sync by hand if a stage is ever
+// added or reclassified.
+
 // Client-safe stage mapping (section 15). Collapses the internal 20-value
 // vocabulary down to six client-facing states, and -- the actually load-
 // bearing part -- has no entry at all for sourced/outreach/engaged/

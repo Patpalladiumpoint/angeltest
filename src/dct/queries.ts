@@ -26,6 +26,11 @@ export type DctDeal = {
   nextInterviewAt: Date | null;
 };
 
+// "Open" means genuinely still in progress -- not just "not yet
+// placed/secured." A closed-lost or nurture-stage engagement is also
+// done, just not via a win; is_open_engagement_stage() (migration 0018)
+// is the one place that full classification lives, kept in sync by hand
+// with OPEN_STAGES in src/domain/stages.ts.
 export async function listOpenDeals(): Promise<DctDeal[]> {
   const rows = await db.execute<{
     engagement_id: string;
@@ -61,7 +66,7 @@ export async function listOpenDeals(): Promise<DctDeal[]> {
       SELECT min(scheduled_at) AS next_interview_at FROM interview
       WHERE engagement_id = e.id AND status = 'scheduled' AND scheduled_at > now()
     ) iv ON true
-    WHERE e.status = 'active' AND e.current_stage NOT IN ('placed', 'secured')
+    WHERE e.status = 'active' AND is_open_engagement_stage(e.current_stage)
     ORDER BY t.due_at ASC NULLS LAST
   `);
 
