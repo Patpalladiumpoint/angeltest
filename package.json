@@ -1,8 +1,8 @@
 {
-  "name": "palladium-point",
+  "name": "palladium-os",
   "version": "0.1.0",
   "private": true,
-  "description": "Palladium Point platform: candidates, firms, engagements, pipelines, outreach, and financials for a five-recruiter executive search desk.",
+  "description": "Palladium OS: orchestration, ledger, and intelligence layer above Crelate, QuickBooks, Gmail, Calendar, and Slack for a five-person executive search firm.",
   "engines": {
     "node": ">=20"
   },
@@ -17,19 +17,19 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx src/db/migrate.ts",
     "db:seed": "tsx src/db/seed.ts",
-    "db:seed-firms": "tsx src/db/seedFirms.ts",
-    "backup:run": "tsx src/custody/backup.ts",
-    "backup:restore-drill": "tsx src/custody/restoreDrill.ts",
-    "export:run": "tsx src/custody/export.ts"
+    "inngest:dev": "inngest-cli dev -u http://localhost:3000/api/inngest"
   },
   "dependencies": {
     "next": "^14.2.15",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "next-auth": "^4.24.8",
+    "@supabase/supabase-js": "^2.45.4",
+    "@supabase/ssr": "^0.5.1",
     "drizzle-orm": "^0.33.0",
     "postgres": "^3.4.4",
-    "@aws-sdk/client-s3": "^3.637.0",
+    "inngest": "^3.22.4",
+    "@anthropic-ai/sdk": "^0.27.3",
+    "@sentry/nextjs": "^8.30.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {

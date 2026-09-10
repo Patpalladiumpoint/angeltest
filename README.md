@@ -1,449 +1,193 @@
-# Palladium Point
+# Palladium OS
 
-Candidate, firm, engagement, pipeline, and outreach system of record for a
-five-recruiter executive search desk covering the Business Insurance Top 100
-Brokers. Full spec: see the project brief this repo was built from (build
-order, data model, and guardrails).
+Orchestration, ledger, and intelligence layer above Crelate, QuickBooks,
+Gmail, Calendar, Slack, and (later) Metaview/SourceWhale/Notion, for a
+five-person executive search firm. Full spec: the project brief this repo
+was built from (`Palladium OS: Build Specification`, v0.1 draft) — build
+order, data model, hard rules, and open questions live there; this README
+tracks status against it.
 
-## Status: Phase 0 (Foundation and custody) + an MVP slice + Phase 1 (Firm graph) + Phase 3 (Core records UI)
+## Status: Phase 0 ("Mirror and prove") — scaffolded, not yet connected to real systems
 
-Phase 2 (migration from Crelate) is deliberately skipped for now: the spec
-marks it **blocking** on verifying Crelate's export API actually supports
-pulling resumes, attachments, and full activity history (spec 7.1, OQ 3),
-which needs real Crelate access/credentials this environment doesn't have.
-Building Phase 3 on top of a live system's records (once the resolver was
-solid) was the more useful next step than guessing at Phase 2.
+Per the spec's own hard rules, this is a **full replacement** of an earlier
+build in this repo that targeted a different, now-superseded spec (a
+candidate/firm collision-gate system called "Palladium Point"). That
+earlier work is gone from this branch, not merged in — the two specs
+described materially different systems (different data model, different
+stack choices), and running both at once would have meant building on an
+unreviewed foundation.
 
-Per the spec's build order, phases ship in sequence and each is
-independently demoable. **This repo currently implements Phase 0 only:**
+### What "scaffolded, not yet connected" means
 
-- Repo scaffold: Next.js (App Router) + TypeScript, Drizzle ORM, Postgres.
-- SSO (OIDC) with two roles (`recruiter`, `admin`) — no local passwords.
-- Append-only `audit_log`, enforced at the database role level (`REVOKE`)
-  plus a trigger as defense in depth. Verified against a real Postgres, not
-  mocked — see `test/audit-log.test.ts`.
-- Global kill switch (`system_settings.outbound_enabled`) with an admin API
-  route and a one-button admin page.
-- S3-compatible object storage client, used by backup/export today and by
-  documents (Phase 3) later.
-- Nightly logical backup script (`npm run backup:run`) to a separate
-  backups bucket, with 35-day retention.
-- Restore drill (`npm run backup:restore-drill`): restores the latest backup
-  into a scratch database and asserts row counts and referential integrity
-  match the source. Wired into CI to run on every push (against a
-  same-run backup) and weekly against the real production backup
-  (`.github/workflows/restore-drill.yml`).
-- On-demand full export (`npm run export:run`): every table to JSONL plus a
-  manifest, one command.
-- CI: typecheck, lint, test on every push/PR.
+This environment has **zero credentials** for Crelate, QuickBooks,
+Supabase, or Inngest, and no npm registry access (`npm install` cannot run
+here — see "A note on this session's constraints" below). Hard rule 1 is
+explicit: *"Never mock an integration. If an external API is unavailable or
+undocumented, stop and report. Do not build a fake adapter and proceed."*
+So instead of guessing:
 
-Everything past Phase 0 (firm graph, migration, candidate/search records,
-ownership, email, research, drafting, review, send, LinkedIn, cadences,
-reporting) was **not built yet at that point**. Building it before custody
-was solid would have meant building business-critical infrastructure on an
-unverified foundation — the spec calls this out explicitly ("Do not skip
-the custody work. It is cheap now and expensive later.").
+- **Schema, migrations, and the adapter framework are real and complete**
+  for Phase 0's scope (spec section 3, section 7). They compile against the
+  pinned dependency versions but have not been run in this sandbox — see
+  the constraints note.
+- **The QuickBooks adapter (`src/adapters/quickbooks/`) is a real
+  implementation** against Intuit's documented, public API (OAuth2 refresh
+  flow, the `/query` endpoint, the QBO query language). It is not mocked —
+  it is simply unconnected, because there is no sandbox company or OAuth
+  app in this environment. Set the five `QUICKBOOKS_*` env vars
+  (`.env.example`) and it will start working.
+- **The Crelate adapter (`src/adapters/crelate/`) is deliberately a
+  stub past `healthCheck()`.** Spec Open Question #1 — plan-tier API
+  access, webhooks vs. polling, rate limits — is unconfirmed, and its
+  default is explicit: *"Stop and report. No safe default."* Writing
+  `pull()`/`push()` against a guessed Crelate endpoint shape would itself be
+  the fake adapter hard rule 1 forbids. Every call to this adapter reports
+  `blocked` and writes an `integration_blocked` event, visible on
+  `/reconciliation`, rather than crashing or silently doing nothing.
 
-## MVP slice: candidates, firms, and the collision gate
+**This is the single biggest blocker to Phase 0 actually shipping.** Confirm
+OQ1 with Crelate (support or account rep) before continuing past this
+scaffold — see `docs/runbook.md` and `src/adapters/crelate/index.ts`.
 
-On top of Phase 0, this repo also has a deliberately small, real, clickable
-slice: **candidates, firms, ownership claims, and the contact-ledger
-cooldown** — the smallest cut that demonstrates the firm's #1 stated problem
-(collision: two recruiters touching the same candidate) with **no LLM, no
-email integration, no firm resolver**. The spec calls this combination
-"fastest real value in the build" (Phase 5) precisely because it needs none
-of that.
+### What's built
 
-What it does:
+- **Schema** (`src/db/schema.ts`, migrations in `src/db/migrations/`):
+  `organization` (singleton config), `users` (roles: `recruiter`/`ops`/
+  `exec`, spec 3.1), `feature_flag` (per-user/per-workflow, hard rule 7),
+  `audit_log` (append-only), `client`, `job`, `candidate` (Crelate mirror,
+  `crelate_id` unique), `engagement`, `placement`, `invoice`, `payment`,
+  `event` (the append-only spine, spec 3.2), `sync_record` (provenance +
+  idempotency, spec 5). Deliberately **not** built yet: `client_contract`,
+  `fee`, `commission_plan`, `commission_entry` (Phase 1 money spine),
+  `task`/`exception` and the declarative stage config (Phase 2),
+  `document`/`document_chunk`/`document_link` (Phase 3) — each migration/
+  schema file says why, at the specific column, rather than a blanket
+  "later."
+- **Append-only enforcement** on both `audit_log` and `event`: `REVOKE
+  UPDATE, DELETE` from the app role and from `PUBLIC`, plus a trigger as
+  defense in depth against a superuser fat-fingering a manual fix. Same
+  pattern for both tables, proven in `test/audit-log.test.ts` (event's
+  equivalent guarantee is exercised the same way — see that file's pattern
+  applied to `event` in a future test pass if one isn't here yet).
+- **Adapter framework** (`src/adapters/types.ts`): `pull`/`push`/
+  `reconcile`/`healthCheck`, every write-capable method takes
+  `mode: 'dry' | 'live'` (hard rule 2). `src/adapters/retry.ts` gives every
+  external call exponential backoff (spec section 8); terminal failures are
+  written to `event` as `adapter_pull_failed`, which is what
+  `/reconciliation`'s "Recent adapter failures" section reads — a real,
+  if minimal, admin failures view rather than a separate `dead_letter`
+  table Phase 0 doesn't otherwise need.
+- **QuickBooks push() is phase-gated shut**, not just credential-gated:
+  Phase 0 is explicitly read-only (spec section 7), so `push()` refuses
+  unconditionally with a named reason, even once QuickBooks is fully
+  connected. Invoice creation is Phase 1.
+- **Inngest scaffold** (`src/inngest/`): nightly cron functions for both
+  pulls plus a nightly reconcile job, and on-demand event-triggered
+  versions of each pull for manual runs (see `docs/runbook.md`).
+- **Auth**: Supabase Auth, Google SSO only (spec section 2, OQ 7 default).
+  No local passwords, no dev-only bypass — Supabase Auth is itself an
+  external service, so unlike the old repo's next-auth-based dev picker,
+  there is no honest way to fake a bypass without either standing up a
+  shadow auth path or contradicting "Google SSO only." The real local-dev
+  equivalent is the Supabase CLI's local stack (`supabase start`), which
+  runs a real GoTrue auth server — see "Running locally" below.
+  Authorization (role, whether an account is provisioned at all) is owned
+  entirely by our own `users` table, matched by email — Supabase proves
+  identity, we own who's allowed in and as what role.
+- **Reconciliation dashboard** (`/reconciliation`, ops/exec only):
+  implements the spec's own Phase 0 checklist verbatim — engagements with
+  no owner, placements with no invoice, placements with no fee, invoices
+  with no placement, duplicate candidates (normalized name + employer),
+  sync drift, integration health, recent adapter failures. "Stage values
+  that do not map" reports "not yet applicable" rather than a guessed
+  stage list, since the stage config it would validate against is Phase 2.
+- **Seed data** (`src/db/seed.ts`): seeds an exec user and optional
+  recruiters for sign-in, plus (behind `SEED_FIXTURES=true`) a small set of
+  clearly `[FIXTURE]`-labeled client/job/candidate/engagement/placement/
+  invoice rows that exercise every reconciliation finding above. These are
+  not real Crelate/QuickBooks data.
 
-- `/candidates` — list every candidate (owner and last-contact visible to
-  everyone, on purpose — spec 5: "Opacity is what created the collision
-  problem"), and a quick-add form.
-- `/candidates/[id]` — claim a candidate, log a contact, see full contact
-  history.
-- `/firms` — a minimal firm list/add (no aliases, no fuzzy resolver — see
-  "What's stubbed" below).
-- **The actual guardrails, not just UI:**
-  - One active claim per candidate, enforced by a partial unique index —
-    proven under a real concurrent-insert race in this session (two
-    simultaneous claims on the same candidate; exactly one wins, the other
-    gets `23505 duplicate key value`).
-  - The 90-day global contact cooldown (spec 8.2: "no candidate receives
-    outbound from anyone within 90 days of the last outbound, even the same
-    owner on a different search") is checked at the moment of logging
-    contact, names who blocked it and when, and writes a
-    `collision_blocked` audit row (feeds the "Collision events blocked"
-    report metric in spec section 9, once reporting exists).
-  - First-touch auto-claim on the first logged contact, same
-    partial-unique-index guarantee against the same race.
-  - `do_not_contact` hard-stops logging.
+### Open questions (spec section 10) — status
 
-**What's stubbed, on purpose, for "quick":**
-
-- No firm resolver (Phase 1) — firms are hand-entered, no aliases/fuzzy
-  matching/M&A chain.
-- No off-limits/eligibility engine (`engagements`, `firm_restrictions`) —
-  the collision gate is the *global* cooldown only, not the full spec 8.1
-  eligibility pipeline.
-- No claim expiry/exclusivity window, no override flow — claims just sit
-  `active` until manually contested.
-- No migration, no email, no outreach/drafting/send, no financials.
-
-None of this is a shortcut on the guardrails that do exist — the parts that
-are built (append-only audit log, one-active-claim, the cooldown gate) are
-real database-level guarantees, verified against a running Postgres, not
-mocked or faked for the demo.
-
-### Trying it locally
-
-```bash
-npm install
-npm run db:migrate
-SEED_ADMIN_EMAIL=you@palladiumpoint.com SEED_RECRUITER_EMAILS=a@x.com,b@x.com npm run db:seed
-npm run dev
-```
-
-Open `/sign-in` and use the **dev sign-in** box (email only, no password) to
-sign in as any seeded user — this path only exists when
-`NODE_ENV !== "production"` (see `src/auth/config.ts`) and is not a
-real-auth fallback, just a way to click through the app without registering
-a Google/Microsoft OAuth app first. To see the collision gate fire: sign in
-as `a@x.com`, add a candidate, log a contact; sign out, sign in as `b@x.com`,
-try to log a contact on the same candidate within 90 days — it's blocked and
-names `a@x.com` and the timestamp.
-
-## Phase 1: firm graph and resolver
-
-The spec calls this phase out specifically: "This phase is where the project
-succeeds or fails quietly. Do not rush it." It's implemented per spec 7.3:
-
-- `firms` (expanded past the MVP's trimmed version), `firm_aliases`,
-  `firm_events` — canonical names, DBAs/former names/abbreviations, and M&A
-  history with source URLs and dates.
-- `src/firms/normalize.ts` — the mechanical normalization step (lowercase,
-  strip punctuation and legal suffixes, expand a small abbreviation set,
-  strip "dba" prefixes). Zero dependencies, so it's the one piece of this
-  whole repo actually **executed** in this sandbox (via the globally
-  available `ts-node`, since `npm install` wasn't possible — see below),
-  not just reasoned about.
-- `src/firms/resolver.ts` — the three-tier resolver (`resolveFirm`): exact
-  match on normalized canonical name (confidence 1.0) → exact match on a
-  normalized alias (0.95) → `pg_trgm` fuzzy match above a 0.85 similarity
-  floor (confidence = score) → `needs_manual_review`. Plus
-  `requiresManualConfirmation()`, the separate, stricter spec 8.1 gate
-  ("below 0.95 confidence → manual review, hard stop") that a successful
-  fuzzy match still has to clear before it's usable for eligibility or
-  outreach — and `walkAcquisitionChain()`, which follows `firm_events` to
-  a firm's current owner and applies the OQ 2 eligibility default
-  (acquired by a Top 100 firm → stays eligible; acquired by a non-list firm
-  → conditional; eligible throughout the announced→effective+12mo
-  transition window regardless).
-- `src/firms/seed-data/top100-2026.ts` — versioned seed data (28 real firms).
-  **Read the provenance note at the top of that file before trusting it for
-  anything real**: businessinsurance.com and the Alliant-hosted Top 100 PDF
-  were both blocked by this session's network policy, so this was built from
-  live web search snippets, not the actual subscription list. Ranks/years
-  marked non-null came from a search result naming both explicitly; the rest
-  are real, well-known firms with no specific rank verified this session.
-  The three acquisition events (Woodruff Sawyer → Gallagher, The Horton
-  Group → Marsh & McLennan, Accession Risk Management Group → Brown & Brown)
-  **are** fully verified against live sources, with real dates and source
-  URLs — two of them are the spec's own worked examples, and the third
-  (Accession's own acquisition, on top of its Risk Strategies DBA) was found
-  while researching the first two and kept because it's a genuinely good
-  test case.
-- `npm run db:seed-firms` loads it. Idempotent (matches by normalized name,
-  updates in place) — and re-running it after editing the seed file **fails
-  loudly** if two entries would normalize to the same string, rather than
-  silently overwriting one with the other. That check exists because it
-  caught a real bug during this build: "Marsh McLennan Agency LLC" and
-  "Marsh & McLennan Cos. Inc." normalize to the identical string once
-  "Agency"/"LLC" are stripped as legal suffixes, which the seed script
-  originally would have resolved by quietly renaming the parent's row.
-- `test/fixtures/messy-employer-strings.ts` — 70 fixtures (spec asks for
-  60+): every seeded firm's canonical name, normalization-equivalent
-  variants, the DBA/alias cases, six real fuzzy matches with their actual
-  measured trigram scores (0.857–0.941), fourteen deliberately-real near
-  misses that fall *just short* of the 0.85 floor, unrelated companies, and
-  empty/garbage input. Every expected outcome was checked against real
-  `similarity()` scores computed against the actual seeded data in this
-  session, not guessed — **100% matched** against a target of 95%.
-- `test/firm-resolver.test.ts` runs the fixture set through the actual
-  `resolveFirm()` function (not the shadow SQL used to build the fixtures)
-  and asserts ≥95%, plus explicit tests for acceptance criteria 9
-  ("Woodruff Sawyer" resolves and applies the Gallagher rule), 10
-  (the spec's own DBA string resolves through the alias path), and 11
-  (a fuzzy match still requires manual confirmation).
-
-### What's still ahead for the firm graph
-
-- No UI hook yet: `/candidates`' firm field is still a manual dropdown
-  (Phase 0 MVP). Wiring `resolveFirm()` into candidate creation — showing
-  the match and its confidence, routing sub-0.95 matches to a manual-review
-  queue — is a natural Phase 3 task, not done here to keep this phase's
-  scope to "the resolver actually works," per the spec's own emphasis.
-- No `needs_manual_review` queue/table yet — the resolver reports the
-  status, but nothing persists or surfaces a review backlog. That's part of
-  Phase 2 (migration) and Phase 3 (core records UI) in the spec's build
-  order, once there's real messy data to review.
-- The abbreviation-expansion list in `normalize.ts` is a small, explicitly
-  non-exhaustive set — there's no canonical dictionary to verify it
-  against, unlike the legal-suffix list the spec gives verbatim.
-
-## Phase 3: core records UI
-
-Spec build order: "Candidate CRUD, merge and unmerge, activity timeline,
-document upload and view, firm and engagement records, full-text and
-faceted search. Deploy this. The team can work out of it while the rest is
-built." All of that is here except migration-scale dedupe (Phase 2) and the
-actual off-limits/eligibility gate (Phase 5, see below).
-
-- **Candidate CRUD** — `/candidates` (list, search, quick-add) and
-  `/candidates/[id]` (full edit form: name, title, firm, specialty,
-  location, seniority, LinkedIn, summary).
-- **The Phase 1 resolver is now wired into candidate create/edit** (this
-  was flagged as a Phase 3 task in the Phase 1 notes above, and is done
-  now): typing a firm as free text runs `resolveFirm()` server-side. A
-  human-picked firm is trusted outright (`manual`, confidence 1.0);
-  otherwise the resolver's result is only auto-applied when it clears the
-  spec 8.1 confidence bar (`requiresManualConfirmation()`). When it
-  doesn't, the candidate page shows the live suggestion inline ("Possible
-  firm match: X (fuzzy), needs confirmation") rather than silently leaving
-  the field blank.
-- **Merge and unmerge** — `mergeCandidatesAction`/`unmergeCandidatesAction`
-  in `src/candidates/actions.ts`. True to spec 3.6 ("soft and reversible for
-  90 days"): nothing is deleted or physically moved. A merged record keeps
-  its own row and its own activity history; `getCandidateDetail()` folds a
-  merged-in record's timeline into the survivor's by querying both, so
-  unmerge is just clearing one column, not reconstructing lost data. The
-  one real edge case here — **both records having an active claim by
-  different recruiters at merge time** — was tested directly against
-  Postgres: the winner's claim is kept, the loser's is released (not
-  dropped silently), and the collision is named in the audit log reason.
-  If only the loser had a claim, it's carried over to the winner instead of
-  being lost.
-- **Unified activity timeline** — a real `activities` table (spec 5)
-  alongside the MVP's lean `contact_ledger`: logging a contact writes both
-  (contact_ledger for the 90-day collision check, activities for the
-  human-readable record with a subject/body). A separate "log other
-  activity" form covers notes/calls/meetings that *aren't* new outbound
-  touches (e.g. writing up a call the candidate initiated) and correctly
-  does not run through the collision gate — recording history isn't the
-  same as initiating contact.
-- **Document upload and view** — `/candidates/[id]` uploads to the
-  documents S3 bucket built in Phase 0 (`putObject`/`getObjectBuffer`,
-  reused as-is) with a computed SHA-256 checksum, and a download route that
-  streams the object back through the app rather than adding
-  `@aws-sdk/s3-request-presigner` as a new dependency just for this.
-  `parse_status` stays `pending`/`not_applicable` — actual text extraction
-  is Phase 7, not started here.
-- **Firm records** — `/firms/[id]` shows a firm's aliases, its full M&A
-  history in both directions (as the acquired party *and* as the acquirer —
-  verified against Postgres that Gallagher's page shows the Woodruff Sawyer
-  acquisition exactly like Woodruff Sawyer's page does), its parent chain,
-  and every candidate currently resolved to it.
-- **Engagement records** — a bare `engagements` table and create form tied
-  to a firm, capturing `off_limits_scope`/`off_limits_expires_at` as data.
-  **Nothing reads these fields yet to actually block a claim or a send** —
-  that gate is explicitly Phase 5 ("off-limits derived from engagements").
-  Wiring it in now would mean guessing at how Phase 5's eligibility
-  pipeline wants to consume it; recording the data now and gating on it
-  later is the honest sequencing.
-- **Full-text and faceted search** — `candidates.search_vector` is a
-  Postgres `GENERATED ALWAYS AS ... STORED` `tsvector` column (weighted:
-  name > title/specialty/firm > location/seniority > summary), not a
-  trigger — it can't drift out of sync with an edit that forgets to fire
-  one. `/candidates` combines a `websearch_to_tsquery` search box with
-  specialty/location facet dropdowns as plain URL search params (a search
-  is a bookmarkable/shareable URL, not client state). Verified directly
-  against Postgres: correct ranking, no false positives on unrelated terms,
-  and correct results when combining a text query with a facet filter.
-
-### What's still deferred
-
-- No migration-scale dedupe (email-first, then name+firm, then fuzzy
-  name+LinkedIn per spec 7.2) — the merge UI here only surfaces exact
-  full-name matches, enough to use by hand today, not the real Phase 2
-  pipeline.
-- No off-limits/eligibility gate consuming `engagements` — Phase 5.
-- No resume text extraction — Phase 7. Documents upload and store; nothing
-  reads `extracted_text` yet.
-- `searches`/`search_id` on `activities` stay unwired until Phase 4.
-
-## Why hand-written SQL migrations
-
-Migrations live as plain `.sql` files in `src/db/migrations/`, applied by a
-small custom runner (`src/db/migrate.ts`) rather than `drizzle-kit`'s
-generated migrations. Two reasons:
-
-1. The audit-log lockdown (`REVOKE`, trigger) and role grants are security
-   properties, not table shape — they read better as explicit, reviewable
-   SQL than as `drizzle-kit` codegen output.
-2. This session's sandbox had no npm registry access (see "A note on this
-   session's constraints" below), so `drizzle-kit generate` could not be
-   run to produce its own migration files. Hand-written SQL sidesteps that
-   without weakening the result — Drizzle's schema (`src/db/schema.ts`) and
-   the SQL migrations are kept in sync by hand and should match; a future
-   session with registry access could switch to `drizzle-kit` generation if
-   preferred, or add a CI check that diffs generated SQL against the
-   hand-written files.
-
-`drizzle.config.ts` is still present so `drizzle-kit studio` / introspection
-tools work against the resulting schema.
+| # | Question | Status |
+|---|---|---|
+| 1 | Crelate API access/shape | **Unresolved, blocking.** See above. |
+| 2 | Commission rules | Not reached — Phase 1. |
+| 3 | Fee models / guarantee terms | Not reached — Phase 1. Spec default (contingency, % of first-year base, 90-day guarantee) not yet encoded anywhere, since no fee logic exists yet. |
+| 4 | Permissions on commission/fee visibility | Partially addressed: `/reconciliation` is ops/exec only as a first cut at "recruiters don't see fee data" (spec default), ahead of real RLS, which needs Phase 1's actual fee tables to be meaningful. |
+| 5 | Volume | Unknown — assuming spec's default (<100 placements/yr, <500 active engagements, <100k candidates) per spec, unverified. |
+| 6 | Actual stage list | Not reached — Phase 2. |
+| 7 | Metaview / SourceWhale API availability | Not reached — Phase 3/4. |
+| 8 | System owner post-launch | Assumed non-engineer + AI assistant per spec default; this README and `docs/runbook.md` are written accordingly. |
 
 ## Running locally
 
 ```bash
-cp .env.example .env      # fill in real values before anything but local dev
+cp .env.example .env
 npm install
-npm run db:migrate        # applies src/db/migrations/*.sql via MIGRATIONS_DATABASE_URL
-# set the app role's password once per environment (not in a migration):
+supabase start                 # local Supabase stack; prints URL/anon key for .env
+npm run db:migrate              # applies src/db/migrations/*.sql
 psql "$MIGRATIONS_DATABASE_URL" -c "ALTER ROLE palladium_app PASSWORD '...' LOGIN;"
-psql "$MIGRATIONS_DATABASE_URL" -c "GRANT CONNECT ON DATABASE ... TO palladium_app;" # done by the migration itself
-npm run db:seed           # SEED_ADMIN_EMAIL=you@firm.com, dev only
+SEED_EXEC_EMAIL=you@palladiumpoint.com SEED_RECRUITER_EMAILS=a@x.com,b@x.com SEED_FIXTURES=true npm run db:seed
 npm run dev
+npx inngest-cli dev -u http://localhost:3000/api/inngest   # separate terminal, for the pull/reconcile functions
 ```
+
+Sign in at `/sign-in` with a Google account matching a seeded email — you'll
+need a Google OAuth provider configured in the local Supabase Auth config
+(`supabase/config.toml` once `supabase init` has been run) for that to work
+end to end.
 
 ### Running tests locally
 
-The test suite is integration-first on purpose — the guarantees that matter
-here (audit-log immutability, a real restore) only mean something against a
-real Postgres and real S3-compatible storage, not mocks. You need:
-
-- A local Postgres reachable at `OWNER_DATABASE_URL` (a superuser/owner
-  connection) and `APP_DATABASE_URL` (the `palladium_app` role — the test
-  suite sets its password).
-- An S3-compatible endpoint (MinIO works well locally) for
-  `DOCUMENTS_BUCKET` / `BACKUPS_BUCKET`.
-- `pg_dump` / `pg_restore` on `PATH` (same major version as the target
-  Postgres).
-
-See `.github/workflows/ci.yml` for the exact env vars and a working MinIO +
-Postgres service-container setup — copying that locally (e.g. via
-`docker compose`) is the fastest way to get `npm test` green.
+Integration-first, same philosophy as the append-only guarantees below:
+the things that matter (audit-log/event immutability, the actual
+reconciliation SQL, the adapters' honest-blocking behavior) only mean
+something against a real Postgres, not mocks. You need `OWNER_DATABASE_URL`
+(superuser/owner) and `APP_DATABASE_URL` (the `palladium_app` role) pointed
+at a local Postgres 16. See `.github/workflows/ci.yml` for a working setup.
 
 ## A note on this session's constraints
 
 This repo was built in a sandboxed session with **no access to the npm
-registry** (or any other package registry) — `npm install` was not runnable
-here. Every file was hand-written and, wherever the underlying mechanism did
-not require Node dependencies, verified directly against a real local
-Postgres 16 instance with `psql`, `pg_dump`, and `pg_restore`:
+registry** (`npm install` returns `403 Forbidden`) and **no Crelate,
+QuickBooks, Supabase, or Inngest credentials**. Every file here was
+hand-written; nothing was run end-to-end against a live dependency graph or
+a live external system this session. What that specifically means:
 
-- The audit-log lockdown was proven against real roles: the app role gets
-  `permission denied` on `UPDATE`/`DELETE`, and even a superuser gets
-  blocked by the trigger, with the row provably unchanged afterward.
-- The migration files were applied end-to-end (including re-applying them
-  to confirm idempotency) against a scratch database.
-- The backup → restore drill pipeline was proven with real `pg_dump`
-  (`--format=custom`) and `pg_restore`, including a live row-count
-  comparison and the foreign-key-introspection query the drill uses to
-  detect orphaned rows.
-- The export command's primary-key detection and row-to-JSON shape were
-  checked against `information_schema` and `row_to_json` directly.
-- The MVP's one-active-claim guarantee was proven under an actual
-  concurrent race (two simultaneous `INSERT`s on the same candidate from
-  two parallel `psql` processes — exactly one succeeds, the other fails
-  with `23505 duplicate key value`), and the collision-cooldown query and
-  the unclaimed-candidate left-join were both run directly against
-  Postgres with the exact SQL the Drizzle query builder produces.
-- `src/firms/normalize.ts` and `src/firms/seed-data/top100-2026.ts` have
-  zero external dependencies, so unlike everything else in this repo they
-  were **actually executed** — via the globally-available `ts-node`, no
-  `npm install` needed — against all 70 resolver fixtures and the full
-  seed data set. That run caught a real bug before it shipped: two seed
-  entries ("Marsh McLennan Agency LLC" and "Marsh & McLennan Cos. Inc.")
-  normalized to the identical string, which would have made the seed
-  script's upsert-by-normalized-name logic silently overwrite one firm's
-  name with the other's. The fix (fail loudly on a collision, and remove
-  the redundant seed entry) is in `seedFirms.ts` and the seed data file.
-- The resolver's three tiers (exact, alias, `pg_trgm` fuzzy) and the
-  acquisition-chain walk were each verified end-to-end with real SQL
-  against the fully seeded database, including the two spec-quoted
-  acceptance-criteria examples (Woodruff Sawyer → Gallagher, Accession →
-  Risk Strategies) and the seed script's idempotency (re-running produces
-  identical row counts).
-- Phase 3's full migration chain (all 5 files) was applied to a fresh
-  database and re-applied on top of itself with zero errors either time.
-  The generated `search_vector` column, the combined text+facet search
-  query, the firm-events self-join in both directions, and the merge
-  claim-collision logic (both records having an active claim by different
-  recruiters) were each proven with real data and real queries against
-  Postgres — not just read for logical consistency.
-
-What was **not** run in this session: `npm install`, `next build`, `tsc`
-against the real dependency graph, or `vitest` itself, since none of those
-tools were installable without registry access. The code is written to
-compile and pass against the pinned dependency versions in `package.json`,
-but that has not been machine-verified end-to-end here. **Before treating
-Phase 0 as done, run `npm install && npm run typecheck && npm run lint &&
-npm test` in an environment with normal network access (this repo's own CI
-will do this automatically on the first push).**
-
-## Open questions (spec section 12)
-
-These are defaults chosen so the build isn't blocked, not decisions the
-client has made. Confirm each before relying on it:
-
-1. **Ownership tie-break and window** — `search_assignment` beats
-   `first_touch`; 90-day rolling exclusivity; 30-day inactivity release.
-   *(Not yet built — Phase 5.)*
-2. **Acquired-firm eligibility** — acquired by a Top 100 firm stays
-   eligible; acquired by a non-list firm goes `conditional`; eligible
-   through `announced_at` + 12 months. *(Implemented in
-   `walkAcquisitionChain()`, Phase 1 — but only as a resolver-level hint.
-   It isn't wired into an actual eligibility/off-limits gate yet; that's
-   Phase 8.)*
-3. **Crelate export completeness — BLOCKING for Phase 2.** Not yet
-   verified in this repo. Confirm resumes, attachments, and full activity
-   history are actually extractable via the Crelate API/CSV export before
-   any migration code is written.
-4. **Data volume** (candidate count, attachment count, years of history) —
-   unknown; determines whether Postgres full-text search needs tuning.
-5. **ATS scope** — this build assumes full replacement (searches,
-   pipelines, placements included).
-6. **Approval routing** — default: peer review, no self-approval.
-   *(Not yet built — Phase 10.)*
-7. **Mailbox / SSO provider** — both Google Workspace and Microsoft
-   Entra/365 are wired in `src/auth/config.ts`, gated on which env vars are
-   set. Confirm which one the firm actually uses before Phase 6 (email
-   sync) and delete the unused provider's code path rather than leaving a
-   dead option live.
-8. **LinkedIn posture** — assisted send only. Automation is a documented,
-   currently-disabled feature flag requiring a separate legal review, not a
-   default. *(Not yet built — Phase 12.)*
-9. **Volume** — assumed under 200 candidates/recruiter/week; revisit queue
-   architecture above ~2,000 scheduled sends/week.
-10. **Top 100 refresh** — annual, manual reseed from a versioned data file.
-    Confirm whether candidates at firms falling off the list stay eligible.
-11. **Data protection basis** — assumed US-only targets under legitimate
-    interest. Any EU/UK/strict-state target goes to legal before Phase 8.
-12. **Retention** — default: indefinite with annual review, anonymize on
-    request.
+- `npm install`, `next build`, `tsc` against the real dependency graph, and
+  `vitest` itself were not runnable here — the same limitation the
+  previous build in this repo hit and disclosed. **Before treating any of
+  this as verified, run `npm install && npm run typecheck && npm run lint
+  && npm test` in an environment with normal network access** (CI will do
+  this automatically on push).
+- The QuickBooks adapter is written against Intuit's real, documented API
+  shape from training knowledge, not verified against a live sandbox
+  company this session — treat it as "should work, unverified" until it's
+  run against a real QuickBooks sandbox.
+- The Crelate adapter intentionally does **not** attempt this kind of
+  best-effort implementation, because unlike QuickBooks, Crelate's actual
+  API contract is an open question the spec itself flags as blocking (OQ1)
+  — there's no documented public shape to write against honestly.
+- The append-only mechanism for `event` (mirrors `audit_log`'s
+  `REVOKE`-plus-trigger pattern, itself proven against a real Postgres in
+  the previous build's session) has not been re-verified against a live
+  database in this session — the SQL is the same shape, applied the same
+  way, but confirm it in your own environment before relying on it, per the
+  spec's own bias toward "run it against something real."
 
 ## Guardrails this repo already enforces
 
-- `audit_log` is append-only at the database level (`REVOKE UPDATE, DELETE`
-  from every role, plus a trigger). No application code path can widen this
-  without editing a migration a reviewer would see.
+- `audit_log` and `event` are both append-only at the database level
+  (`REVOKE UPDATE, DELETE`, plus a trigger). No application code path can
+  widen this without editing a migration a reviewer would see.
 - The app connects to Postgres as `palladium_app`, never as the migrations
   owner/superuser.
-- The kill switch is a single boolean read fresh on every check
-  (`isOutboundEnabled()`), not cached — required so a halt takes effect
-  within one polling interval once the send worker exists.
-- `linkedin_automation` ships seeded `false` with the ToS/account-risk
-  rationale in the row itself (`feature_flags.description`), matching spec
-  3.2: this is a deliberate, logged risk acceptance to flip, not a default.
-- No local passwords anywhere in the auth path.
-
-## What's deliberately deferred, not forgotten
-
-- The money-path lint rule (bare `number` banned from `Cents` fields, spec
-  3.8) belongs with the financials tables it protects, not Phase 0, since
-  there are no money columns yet to protect and a blanket ban on `number`
-  would be wrong for the rest of the codebase.
-- Bucket versioning/lifecycle rules (35-day backup retention,
-  document versioning) are infrastructure provisioning (Terraform/console),
-  not application code — `deletePastRetention()` in `src/custody/backup.ts`
-  is a redundant application-level enforcement for providers without
-  lifecycle support, not the primary mechanism.
+- Every outbound-capable adapter method takes `mode: 'dry' | 'live'` (hard
+  rule 2) — `dry` never touches the network or the database beyond logging
+  an `adapter_dry_run` event.
+- QuickBooks `push()` refuses unconditionally in Phase 0, independent of
+  whether credentials are configured — a phase gate, not just a credential
+  gate.
+- No local passwords anywhere in the auth path; Supabase Auth (Google SSO
+  only) is the only sign-in mechanism, including in local dev.

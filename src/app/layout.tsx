@@ -1,6 +1,7 @@
 export const metadata = {
-  title: "Palladium Point",
-  description: "Candidate, firm, engagement, pipeline, and outreach system of record.",
+  title: "Palladium OS",
+  description:
+    "Orchestration, ledger, and intelligence layer above Crelate, QuickBooks, Gmail, Calendar, and Slack.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

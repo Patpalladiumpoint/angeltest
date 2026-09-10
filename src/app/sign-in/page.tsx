@@ -1,43 +1,37 @@
 "use client";
 
-import { useState } from "react";
-import { signIn } from "next-auth/react";
+import { createSupabaseBrowserClient } from "@/auth/supabase-browser";
 
-// Only ever shows the provider actually configured for this environment
-// (see src/auth/config.ts) -- there is no local-password fallback to offer.
-// The dev picker below is additionally gated server-side to non-production;
-// it's shown unconditionally here purely as a dev convenience -- signing in
-// through it against a production auth config would just fail server-side.
+// Google SSO only (spec section 2, OQ 7 defaulted to Google Workspace).
+// There is no local-password fallback and no dev bypass here: Supabase
+// Auth's own local dev stack (`supabase start`, via the Supabase CLI) is
+// the honest local-dev equivalent -- a real GoTrue auth server running
+// locally, not an app-code shortcut around SSO. See README "Running
+// locally."
 export default function SignInPage() {
-  const [email, setEmail] = useState("");
+  async function signInWithGoogle() {
+    const supabase = createSupabaseBrowserClient();
+    await supabase.auth.signInWithOAuth({
+      provider: "google",
+      options: {
+        redirectTo: `${window.location.origin}/auth/callback`,
+        // Restricts at the IdP level to the firm's Workspace domain (OQ 7).
+        // Re-checked nowhere server-side today because Phase 0 has no
+        // self-serve signup: an unprovisioned account simply isn't in the
+        // users table and getCurrentUser() returns null regardless of
+        // which Google account authenticated.
+        queryParams: process.env.NEXT_PUBLIC_GOOGLE_WORKSPACE_DOMAIN
+          ? { hd: process.env.NEXT_PUBLIC_GOOGLE_WORKSPACE_DOMAIN }
+          : {},
+      },
+    });
+  }
 
   return (
     <main>
-      <h1>Sign in</h1>
-      <p>Sign in with your Palladium Point Workspace or Microsoft 365 account.</p>
-      <button onClick={() => signIn("google")}>Sign in with Google</button>
-      <button onClick={() => signIn("azure-ad")}>Sign in with Microsoft</button>
-
-      {process.env.NODE_ENV !== "production" && (
-        <section style={{ marginTop: "2rem", borderTop: "1px solid #ccc", paddingTop: "1rem" }}>
-          <h2>Dev sign-in</h2>
-          <p>Local development only. Picks a seeded user by email, no password.</p>
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              void signIn("dev-picker", { email, callbackUrl: "/" });
-            }}
-          >
-            <input
-              type="email"
-              placeholder="you@palladiumpoint.com"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-            />
-            <button type="submit">Continue</button>
-          </form>
-        </section>
-      )}
+      <h1>Palladium OS</h1>
+      <p>Sign in with your Palladium Point Google account.</p>
+      <button onClick={signInWithGoogle}>Sign in with Google</button>
     </main>
   );
 }
