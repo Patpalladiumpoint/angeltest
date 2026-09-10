@@ -5,6 +5,9 @@ import { appUser } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { AppShell } from "@/components/AppShell";
 import { listActiveEngagements, getPipelineKpis, STALE_DAYS_THRESHOLD } from "@/engagements/queries";
+import { listOverdueTasks } from "@/tasks/queries";
+import { listInterviewsToday } from "@/interviews/queries";
+import { getArSummary } from "@/finance/queries";
 
 const STAGE_PILL: Record<string, string> = {
   sourced: "pill-slate",
@@ -53,10 +56,49 @@ export default async function DashboardPage() {
   if (!actor) redirect("/sign-in");
 
   const [me] = await db.select({ name: appUser.name }).from(appUser).where(eq(appUser.id, actor.userId)).limit(1);
-  const [engagements, kpis] = await Promise.all([listActiveEngagements(), getPipelineKpis()]);
+  const [engagements, kpis, overdueTasks, interviewsToday, ar] = await Promise.all([
+    listActiveEngagements(),
+    getPipelineKpis(),
+    listOverdueTasks(),
+    listInterviewsToday(),
+    getArSummary(actor),
+  ]);
 
   return (
-    <AppShell actor={actor} userName={me?.name ?? "You"} activeNav="pipeline" pageTitle="Pipeline" mergeQueueCount={kpis.pendingMerges}>
+    <AppShell
+      actor={actor}
+      userName={me?.name ?? "You"}
+      activeNav="pipeline"
+      pageTitle="Pipeline"
+      mergeQueueCount={kpis.pendingMerges}
+      overdueTaskCount={overdueTasks.length}
+    >
+      {/* Executive summary strip (section 13): "what needs attention" at a
+          glance. Deliberately not a full re-implementation of DCT/Finance/
+          Scorecards here -- each of those pages already owns its detail
+          view; this is three numbers with a link to where the detail
+          actually lives, matching the brief's own "clarity over
+          completeness" instruction rather than duplicating full tables. */}
+      {(overdueTasks.length > 0 || interviewsToday.length > 0 || ar.overdue > 0) && (
+        <div className="kpi-row" style={{ marginBottom: 22 }}>
+          <a href="/dct?view=overdue" className="card kpi" style={{ display: "block" }}>
+            <div className="kpi-label">Needs Attention</div>
+            <div className="kpi-value mono warn">{overdueTasks.length}</div>
+            <div className="kpi-sub">overdue tasks →</div>
+          </a>
+          <a href="/interviews" className="card kpi" style={{ display: "block" }}>
+            <div className="kpi-label">Today</div>
+            <div className="kpi-value mono">{interviewsToday.length}</div>
+            <div className="kpi-sub">interviews scheduled →</div>
+          </a>
+          <a href="/finance" className="card kpi" style={{ display: "block" }}>
+            <div className="kpi-label">Financial Flags</div>
+            <div className={`kpi-value mono${ar.overdue > 0 ? " warn" : ""}`}>${ar.overdue.toLocaleString()}</div>
+            <div className="kpi-sub">overdue A/R →</div>
+          </a>
+        </div>
+      )}
+
       <div className="kpi-row">
         <div className="card kpi">
           <div className="kpi-label">Active Engagements</div>
