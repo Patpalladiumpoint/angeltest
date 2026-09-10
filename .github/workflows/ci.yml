@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: palladium_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      minio:
+        image: bitnami/minio:latest
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        ports: ["9000:9000"]
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/live"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      OWNER_DATABASE_URL: postgres://postgres:postgres@localhost:5432/palladium_test
+      MIGRATIONS_DATABASE_URL: postgres://postgres:postgres@localhost:5432/palladium_test
+      APP_DATABASE_URL: postgres://palladium_app:palladium_app_test@localhost:5432/palladium_test
+      DATABASE_URL: postgres://palladium_app:palladium_app_test@localhost:5432/palladium_test
+      RESTORE_DRILL_DATABASE_URL: postgres://postgres:postgres@localhost:5432/palladium_restore_drill
+      DOCUMENTS_BUCKET: palladium-documents-test
+      BACKUPS_BUCKET: palladium-backups-test
+      S3_ENDPOINT: http://localhost:9000
+      BACKUPS_S3_ENDPOINT: http://localhost:9000
+      S3_REGION: us-east-1
+      BACKUPS_S3_REGION: us-east-1
+      S3_FORCE_PATH_STYLE: "true"
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+      BACKUPS_S3_ACCESS_KEY_ID: minioadmin
+      BACKUPS_S3_SECRET_ACCESS_KEY: minioadmin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm run lint
+
+      - run: npm test

@@ -1,0 +1,10 @@
+node_modules/
+.next/
+dist/
+*.log
+.env
+.env.local
+.DS_Store
+coverage/
+/tmp-export/
+/tmp-restore-drill/

@@ -1,0 +1,67 @@
+name: Weekly restore drill
+
+# Spec 3.7: "Restore drill as an automated test that provisions from the
+# latest backup and asserts row counts and referential integrity. Run it
+# weekly in CI. A backup nobody has restored is not a backup."
+#
+# Unlike ci.yml's custody test (which backs up and restores a database it
+# just created, proving the mechanism), this workflow restores the actual
+# latest production backup from the production backups bucket, proving the
+# real backup chain works. It needs a scratch Postgres to restore into --
+# provisioned here as a throwaway service container, never a shared
+# environment -- and the same migrations-role production credentials the app
+# uses for schema changes (it needs to read row counts and record the drill
+# outcome on system_settings), held as repo secrets.
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Monday 06:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  restore-drill:
+    runs-on: ubuntu-latest
+
+    services:
+      scratch-postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      MIGRATIONS_DATABASE_URL: ${{ secrets.PROD_MIGRATIONS_DATABASE_URL }}
+      RESTORE_DRILL_DATABASE_URL: postgres://postgres:postgres@localhost:5432/palladium_restore_drill
+      BACKUPS_BUCKET: ${{ secrets.PROD_BACKUPS_BUCKET }}
+      BACKUPS_S3_ENDPOINT: ${{ secrets.PROD_BACKUPS_S3_ENDPOINT }}
+      BACKUPS_S3_REGION: ${{ secrets.PROD_BACKUPS_S3_REGION }}
+      BACKUPS_S3_ACCESS_KEY_ID: ${{ secrets.PROD_BACKUPS_S3_ACCESS_KEY_ID }}
+      BACKUPS_S3_SECRET_ACCESS_KEY: ${{ secrets.PROD_BACKUPS_S3_SECRET_ACCESS_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Create scratch restore-drill database
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d postgres \
+            -c "CREATE DATABASE palladium_restore_drill;"
+
+      - run: npm run backup:restore-drill
+
+      - name: Alert on failure
+        if: failure()
+        run: |
+          echo "::error::Weekly restore drill FAILED. The last verified-good backup may be stale. Page an admin -- see spec section 9, 'Last successful restore drill.'"
