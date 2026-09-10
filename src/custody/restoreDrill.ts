@@ -1,8 +1,6 @@
 #!/usr/bin/env tsx
-// The restore drill (spec 3.7, acceptance criterion 1): "A restore from the
-// latest nightly backup provisions a working database and passes
-// referential integrity assertions. Runs weekly in CI." A backup nobody has
-// restored is not a backup.
+// The restore drill (section 6: "tested backup and restore... untested
+// restores do not count"). A backup nobody has restored is not a backup.
 //
 // Steps:
 //   1. Find the most recent object in the backups bucket.
@@ -12,16 +10,17 @@
 //      DB (MIGRATIONS_DATABASE_URL) at drill time.
 //   4. Assert no foreign key in the restored DB points at a row that does
 //      not exist -- explicit, not just "pg_restore didn't error."
-//   5. Record the drill outcome (timestamp and pass/fail) to
-//      system_settings so "last successful restore drill" (spec section 9,
-//      Data health) has something to report.
+//   5. Record the outcome as an event (see backup.ts's comment on why
+//      events, not a settings table).
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import postgres from "postgres";
-import { backupsBucket, backupsClient, getObjectBuffer, listObjectsWithMetadata } from "@/storage/s3";
+import { db } from "@/db/client";
+import { writeEvent } from "@/events/writer";
+import { backupsBucket, getObjectBuffer, listObjectsWithMetadata } from "@/storage/s3";
 
 const execFileAsync = promisify(execFile);
 
@@ -41,23 +40,17 @@ export async function runRestoreDrill(): Promise<DrillResult> {
     throw new Error("RESTORE_DRILL_DATABASE_URL must not be the same database as the source");
   }
 
-  const objects = await listObjectsWithMetadata({
-    client: backupsClient,
-    bucket: backupsBucket(),
-    prefix: "postgres/",
-  });
+  const objects = await listObjectsWithMetadata({ bucket: backupsBucket(), prefix: "postgres/" });
   if (objects.length === 0) {
     throw new Error("No backups found in the backups bucket -- run backup:run first");
   }
-  const latest = objects.reduce((a, b) =>
-    (a.lastModified?.getTime() ?? 0) >= (b.lastModified?.getTime() ?? 0) ? a : b,
-  );
+  const latest = objects.reduce((a, b) => ((a.lastModified?.getTime() ?? 0) >= (b.lastModified?.getTime() ?? 0) ? a : b));
 
   const tmpDir = await mkdtemp(path.join(tmpdir(), "palladium-restore-drill-"));
   const dumpPath = path.join(tmpDir, "latest.dump");
 
   try {
-    const body = await getObjectBuffer({ client: backupsClient, bucket: backupsBucket(), key: latest.key });
+    const body = await getObjectBuffer({ bucket: backupsBucket(), key: latest.key });
     await writeFile(dumpPath, body);
 
     await recreateDrillDatabase(drillUrl);
@@ -66,10 +59,7 @@ export async function runRestoreDrill(): Promise<DrillResult> {
     const tables = await listUserTables(sourceUrl);
     const tableCounts: DrillResult["tableCounts"] = {};
     for (const table of tables) {
-      const [sourceCount, restoredCount] = await Promise.all([
-        countRows(sourceUrl, table),
-        countRows(drillUrl, table),
-      ]);
+      const [sourceCount, restoredCount] = await Promise.all([countRows(sourceUrl, table), countRows(drillUrl, table)]);
       tableCounts[table] = { source: sourceCount, restored: restoredCount };
     }
 
@@ -77,7 +67,14 @@ export async function runRestoreDrill(): Promise<DrillResult> {
     const orphanFindings = await findOrphanedForeignKeys(drillUrl);
 
     const passed = mismatches.length === 0 && orphanFindings.length === 0;
-    await recordDrillOutcome(sourceUrl, passed);
+    await writeEvent(db, {
+      type: "restore_drill.completed",
+      source: "system",
+      entityType: "system",
+      entityId: "restore_drill",
+      payload: { backupKey: latest.key, passed, mismatches, orphanFindings },
+      occurredAt: new Date(),
+    });
 
     if (!passed) {
       const details = [
@@ -93,19 +90,6 @@ export async function runRestoreDrill(): Promise<DrillResult> {
     return { backupKey: latest.key, tableCounts, orphanFindings, passed };
   } finally {
     await rm(tmpDir, { recursive: true, force: true });
-  }
-}
-
-async function recordDrillOutcome(sourceUrl: string, passed: boolean): Promise<void> {
-  const sql = postgres(sourceUrl, { max: 1 });
-  try {
-    await sql`
-      UPDATE system_settings
-      SET last_restore_drill_at = now(), last_restore_drill_passed = ${passed}
-      WHERE id = 1
-    `;
-  } finally {
-    await sql.end();
   }
 }
 
@@ -153,11 +137,10 @@ async function countRows(connectionString: string, table: string): Promise<numbe
   }
 }
 
-// Note: the information_schema join below pairs key_column_usage and
+// Note: this information_schema join pairs key_column_usage and
 // constraint_column_usage positionally, which is only reliable for
-// single-column foreign keys. Every FK in the schema today is
-// single-column; if a composite FK is ever added, this needs to switch to
-// pg_constraint's conkey/confkey arrays instead.
+// single-column foreign keys. Every FK in this schema is single-column; a
+// composite FK would need pg_constraint's conkey/confkey arrays instead.
 async function findOrphanedForeignKeys(connectionString: string): Promise<string[]> {
   const sql = postgres(connectionString, { max: 1 });
   try {

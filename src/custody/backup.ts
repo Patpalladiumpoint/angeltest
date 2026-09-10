@@ -1,22 +1,23 @@
 #!/usr/bin/env tsx
-// Nightly logical backup (spec 3.7): pg_dump to a custom-format archive,
+// Nightly logical backup (section 6: "Nightly automated backup with a
+// documented, tested restore"). pg_dump to a custom-format archive,
 // uploaded to the backups bucket, which must live in a different
-// account/region than the primary DB (see .env.example). Run this from the
-// scheduler process on a nightly cron, not from the web process.
+// account/region than the primary DB (see .env.example).
 //
-// 35-day retention is enforced primarily by a bucket lifecycle rule on
-// BACKUPS_BUCKET (set once at infrastructure provisioning time -- see
-// README "Backups and restore"), because that holds even if this script
-// never runs again. deletePastRetention() below is a second, redundant
-// enforcement for S3-compatible providers with no lifecycle support.
+// Outcome is recorded as an event (type='backup.completed', source=
+// 'system') rather than a dedicated system_settings row -- v3.0's schema
+// doesn't have a settings singleton table, and the event spine (spec 3.3)
+// is already the place operational facts land; the data quality
+// report/dashboard reads the latest such event for "last successful
+// backup."
 import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import postgres from "postgres";
-import { backupsBucket, backupsClient, putObject, listObjectsWithMetadata } from "@/storage/s3";
-import { DeleteObjectCommand } from "@aws-sdk/client-s3";
+import { db } from "@/db/client";
+import { writeEvent } from "@/events/writer";
+import { backupsBucket, putObject, listObjectsWithMetadata, deleteObject } from "@/storage/s3";
 
 const execFileAsync = promisify(execFile);
 
@@ -38,7 +39,6 @@ export async function runBackup(): Promise<{ key: string; checksumSha256: string
     const key = `${BACKUP_PREFIX}${timestamp}.dump`;
 
     const { checksumSha256 } = await putObject({
-      client: backupsClient,
       bucket: backupsBucket(),
       key,
       body,
@@ -48,7 +48,14 @@ export async function runBackup(): Promise<{ key: string; checksumSha256: string
     console.log(`Backup uploaded: ${key} (${body.length} bytes, sha256 ${checksumSha256})`);
 
     await deletePastRetention();
-    await recordLastBackup(connectionString);
+    await writeEvent(db, {
+      type: "backup.completed",
+      source: "system",
+      entityType: "system",
+      entityId: "backup",
+      payload: { key, checksumSha256, sizeBytes: body.length },
+      occurredAt: new Date(),
+    });
 
     return { key, checksumSha256, sizeBytes: body.length };
   } finally {
@@ -56,30 +63,13 @@ export async function runBackup(): Promise<{ key: string; checksumSha256: string
   }
 }
 
-// Feeds the Data health report's "Last successful backup" line (spec
-// section 9). Written to system_settings, not audit_log -- this is
-// operational status, not a record of a business state transition.
-async function recordLastBackup(connectionString: string): Promise<void> {
-  const sql = postgres(connectionString, { max: 1 });
-  try {
-    await sql`UPDATE system_settings SET last_backup_at = now() WHERE id = 1`;
-  } finally {
-    await sql.end();
-  }
-}
-
 async function deletePastRetention(): Promise<void> {
-  const objects = await listObjectsWithMetadata({
-    client: backupsClient,
-    bucket: backupsBucket(),
-    prefix: BACKUP_PREFIX,
-  });
-
+  const objects = await listObjectsWithMetadata({ bucket: backupsBucket(), prefix: BACKUP_PREFIX });
   const cutoff = Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000;
 
   for (const obj of objects) {
     if (obj.lastModified && obj.lastModified.getTime() < cutoff) {
-      await backupsClient.send(new DeleteObjectCommand({ Bucket: backupsBucket(), Key: obj.key }));
+      await deleteObject({ bucket: backupsBucket(), key: obj.key });
       console.log(`Pruned backup past ${RETENTION_DAYS}-day retention: ${obj.key}`);
     }
   }

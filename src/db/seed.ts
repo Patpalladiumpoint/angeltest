@@ -1,45 +1,47 @@
 #!/usr/bin/env tsx
-// Dev-only convenience: seeds an admin user (and optionally a couple of
-// recruiters) so the app has someone to sign in as -- via the dev-only
-// credentials picker (src/auth/config.ts) -- before real SSO is wired to a
-// real Workspace/Entra tenant. Never run against a real environment: there
-// is no local-password path to protect (spec: "No local passwords"), this
-// only seeds the row identity SSO will match against by email on first
-// login.
-import { db, queryClient } from "./client";
-import { users } from "./schema";
+// Dev/CI seed: one organization plus one user per SEED_*_EMAIL env var.
+// Idempotent (ON CONFLICT DO NOTHING on email) so it's safe to run against
+// an already-seeded database.
+import { db } from "@/db/client";
+import { organization, appUser } from "@/db/schema";
+import { eq } from "drizzle-orm";
 
 async function main() {
-  const adminEmail = process.env.SEED_ADMIN_EMAIL;
-  if (!adminEmail) {
-    throw new Error("Set SEED_ADMIN_EMAIL to seed an initial admin user");
+  const orgName = process.env.SEED_ORGANIZATION_NAME ?? "Palladium Point";
+  const [org] = await db.select().from(organization).limit(1);
+  const organizationId = org?.id ?? (await db.insert(organization).values({ name: orgName }).returning())[0]!.id;
+  console.log(`organization: ${orgName} (${organizationId})`);
+
+  const execEmail = process.env.SEED_EXEC_EMAIL;
+  const opsEmails = (process.env.SEED_OPS_EMAILS ?? "").split(",").map((e) => e.trim()).filter(Boolean);
+  const recruiterEmails = (process.env.SEED_RECRUITER_EMAILS ?? "").split(",").map((e) => e.trim()).filter(Boolean);
+
+  const users: { email: string; name: string; role: "recruiter" | "ops" | "exec" }[] = [];
+  if (execEmail) users.push({ email: execEmail, name: execEmail.split("@")[0]!, role: "exec" });
+  for (const email of opsEmails) users.push({ email, name: email.split("@")[0]!, role: "ops" });
+  for (const email of recruiterEmails) users.push({ email, name: email.split("@")[0]!, role: "recruiter" });
+
+  if (users.length === 0) {
+    console.log(
+      "No SEED_EXEC_EMAIL/SEED_OPS_EMAILS/SEED_RECRUITER_EMAILS set -- organization created with no users. " +
+        "Set at least SEED_EXEC_EMAIL to seed a usable dev account.",
+    );
   }
 
-  await db
-    .insert(users)
-    .values({ email: adminEmail, name: "Admin", role: "admin" })
-    .onConflictDoNothing({ target: users.email });
-  console.log(`Seeded admin user ${adminEmail} (or it already existed).`);
-
-  // SEED_RECRUITER_EMAILS="a@x.com,b@x.com" -- useful for demoing the
-  // collision gate, which needs at least two distinct recruiters.
-  const recruiterEmails = (process.env.SEED_RECRUITER_EMAILS ?? "")
-    .split(",")
-    .map((e) => e.trim())
-    .filter(Boolean);
-
-  for (const email of recruiterEmails) {
-    await db
-      .insert(users)
-      .values({ email, name: email.split("@")[0]!, role: "recruiter" })
-      .onConflictDoNothing({ target: users.email });
-    console.log(`Seeded recruiter ${email} (or it already existed).`);
+  for (const u of users) {
+    const [existing] = await db.select().from(appUser).where(eq(appUser.email, u.email)).limit(1);
+    if (existing) {
+      console.log(`user exists: ${u.email} (${existing.role})`);
+      continue;
+    }
+    const [created] = await db.insert(appUser).values({ organizationId, ...u }).returning();
+    console.log(`user created: ${created!.email} (${created!.role})`);
   }
 }
 
 main()
+  .then(() => process.exit(0))
   .catch((err) => {
     console.error(err);
     process.exit(1);
-  })
-  .finally(() => queryClient.end());
+  });

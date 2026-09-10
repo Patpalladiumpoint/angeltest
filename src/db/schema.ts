@@ -11,326 +11,460 @@ import {
   pgEnum,
   uniqueIndex,
   index,
-  type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
-// Phase 0 scope only: the tables every later phase depends on for identity,
-// audit, and runtime config. Candidate/firm/search/financial tables land in
-// their own phases per the build order (spec section 10).
+// Palladium OS MVP, Phase 1 (foundation and narrow import) schema. Section 3
+// of the spec presents the data model as one unit; Phase 1 lays down every
+// table in 3.1 (core) and 3.3 (process) because they're what the narrow
+// importer (DECISION 4) needs to write into, and because "migrations only,
+// no manual schema changes" makes getting the shape right up front cheaper
+// than bolting it on later. What's deliberately NOT here: the 3.4 money
+// ledger (fee/invoice/payment/commission_plan_version/commission_entry) --
+// that's Phase 2's "money spine," built from the legacy_commission_import
+// staging table below once the commission engine and shadow harness exist
+// (DECISION 6). Phase 1 imports the historical facts; Phase 2 calculates
+// and reconciles them.
 
-export const userRoleEnum = pgEnum("user_role", ["recruiter", "admin"]);
+// --- Organization and users -------------------------------------------------
 
-// Two roles, full stop. No permissions matrix — see spec section 5 and the
-// working agreement's "resist configurability" rule.
-export const users = pgTable("users", {
+export const organization = pgTable("organization", {
   id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const ORGANIZATION_SINGLETON_NOTE =
+  "Single-row config table (spec 3.1). Enforced by convention (one seeded row) -- see src/db/seed.ts.";
+
+// Section 8 permissions matrix: three roles, full stop. Row level security
+// (0007_permissions_rls.sql) enforces the restrictions in that table --
+// recruiters cannot read others' commission or a client's fee percent --
+// this enum just names the role a session authenticates as.
+export const userRoleEnum = pgEnum("app_user_role", ["recruiter", "ops", "exec"]);
+
+// "user" is a reserved word in Postgres; the table is named app_user to
+// avoid quoting it everywhere. active_commission_plan_id is added by Phase
+// 2's migration once commission_plan_version exists -- see that phase's
+// migration notes.
+export const appUser = pgTable("app_user", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  organizationId: uuid("organization_id")
+    .notNull()
+    .references(() => organization.id),
+  authUserId: uuid("auth_user_id").unique(), // Supabase auth.users.id once wired to a real project
   email: text("email").notNull().unique(),
   name: text("name").notNull(),
   role: userRoleEnum("role").notNull().default("recruiter"),
-  mailboxProvider: text("mailbox_provider"),
-  oauthTokenRef: text("oauth_token_ref"),
-  dailyEmailCap: integer("daily_email_cap").notNull().default(40),
-  timezone: text("timezone").notNull().default("America/New_York"),
-  voiceProfile: jsonb("voice_profile"),
   isActive: boolean("is_active").notNull().default(true),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
-// Single-row config tables (spec 5, "Platform"). Enforced to exactly one row
-// by a fixed-id upsert pattern (see systemSettingsSingletonId below), not a
-// generic settings framework.
-export const systemSettings = pgTable("system_settings", {
-  id: integer("id").primaryKey().default(1),
-  // Global kill switch (3.1). The send worker must read this every poll.
-  outboundEnabled: boolean("outbound_enabled").notNull().default(true),
-  // Custody operational state (3.7 / section 9 "Data health": "Last
-  // successful backup and last successful restore drill"). Written by
-  // src/custody/backup.ts and src/custody/restoreDrill.ts, read by the
-  // Data health report once that phase exists.
-  lastBackupAt: timestamp("last_backup_at", { withTimezone: true }),
-  lastRestoreDrillAt: timestamp("last_restore_drill_at", { withTimezone: true }),
-  lastRestoreDrillPassed: boolean("last_restore_drill_passed"),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-  updatedBy: uuid("updated_by").references(() => users.id),
-});
+// --- Person: canonical human record (spec 3.1, 3.2) -------------------------
+// "The same human is a candidate on one search, a client contact on another,
+// and a referral source on a third. One person, many roles." Not
+// deferrable -- it's the single most expensive thing to change later.
 
-export const featureFlags = pgTable("feature_flags", {
-  key: text("key").primaryKey(),
-  enabled: boolean("enabled").notNull().default(false),
-  description: text("description").notNull(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-  updatedBy: uuid("updated_by").references(() => users.id),
-});
-
-// Append-only audit trail (3.6). UPDATE and DELETE are revoked on this table
-// at the database role level in migrations/0002_audit_log_lockdown.sql — do
-// not rely on application code alone to enforce that.
-export const auditLog = pgTable("audit_log", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  actorUserId: uuid("actor_user_id").references(() => users.id),
-  entityType: text("entity_type").notNull(),
-  entityId: text("entity_id").notNull(),
-  action: text("action").notNull(),
-  before: jsonb("before"),
-  after: jsonb("after"),
-  reason: text("reason"),
-  occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull().defaultNow(),
-});
-
-export const SYSTEM_SETTINGS_SINGLETON_ID = 1;
-
-// --- Candidates, firms, ownership -------------------------------------------
-// Started as the smallest MVP cut of spec section 5 demonstrating the
-// firm's #1 stated problem -- collision -- with no LLM or email sync
-// involved. The firm graph/resolver (Phase 1) and eligibility/off-limits
-// engine below are now real: firms/firmAliases/firmEvents and the resolver
-// in src/firms/resolver.ts. Still not built: eligibility/off-limits gating
-// itself (Phase 5), LLM-driven outreach, and email sync -- see README for
-// exactly what each phase covers.
-
-export const firmStatusEnum = pgEnum("firm_status", ["active", "acquired", "renamed"]);
-export const firmTypeEnum = pgEnum("firm_type", ["brokerage", "carrier", "mga", "other"]);
-
-// Phase 1 (spec section 5, "Firms and clients" / section 7.3 resolver).
-// canonicalName is the resolver's exact-match target; parentFirmId lets an
-// acquired firm's eligibility roll up to its acquirer without maintaining a
-// separate table by hand (spec: "Placement protection is derived too...
-// Compute it, do not maintain it by hand" -- same philosophy applies here).
-export const firms = pgTable(
-  "firms",
+export const person = pgTable(
+  "person",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    canonicalName: text("canonical_name").notNull(),
-    // Maintained by application code (normalizeEmployerString() in
-    // src/firms/resolver.ts) on every insert/update, mirroring how
-    // firm_aliases.normalized_alias is populated. The resolver's exact and
-    // fuzzy tiers both compare against this, not the raw canonicalName --
-    // spec 7.3 step 2a is explicit that the exact match is "on
-    // firms.canonical_name normalized."
-    normalizedCanonicalName: text("normalized_canonical_name"),
-    top100Rank: integer("top100_rank"),
-    top100ListYear: integer("top100_list_year"),
-    // Reporting figure from the Top 100 list, in whole US dollars. Not part
-    // of the spec 3.8 money-integrity guardrail (that's specifically
-    // invoices/commissions/placements) -- this is informational data about
-    // a firm, not a transaction, so it deliberately doesn't use the Cents
-    // branded type.
-    usBrokerageRevenueDollars: bigint("us_brokerage_revenue_dollars", { mode: "number" }),
-    status: firmStatusEnum("status").notNull().default("active"),
-    firmType: firmTypeEnum("firm_type").notNull().default("brokerage"),
-    parentFirmId: uuid("parent_firm_id").references((): AnyPgColumn => firms.id),
-    website: text("website"),
-    notes: text("notes"),
-    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  },
-  (table) => [
-    uniqueIndex("firms_normalized_name_unique_idx")
-      .on(table.normalizedCanonicalName)
-      .where(sql`${table.normalizedCanonicalName} IS NOT NULL`),
-  ],
-);
-
-export const firmAliasTypeEnum = pgEnum("firm_alias_type", [
-  "dba",
-  "former_name",
-  "abbreviation",
-  "misspelling",
-]);
-
-// The resolver's second-tier match (spec 7.3 step 2b, confidence 0.95).
-// normalizedAlias is precomputed at seed/insert time by the same
-// normalizeEmployerString() the resolver runs on incoming strings, so the
-// comparison is normalized-to-normalized, not normalized-to-raw.
-export const firmAliases = pgTable(
-  "firm_aliases",
-  {
-    id: uuid("id").primaryKey().defaultRandom(),
-    firmId: uuid("firm_id")
+    organizationId: uuid("organization_id")
       .notNull()
-      .references(() => firms.id),
-    alias: text("alias").notNull(),
-    aliasType: firmAliasTypeEnum("alias_type").notNull(),
-    normalizedAlias: text("normalized_alias").notNull(),
-  },
-  (table) => [uniqueIndex("firm_aliases_normalized_unique_idx").on(table.normalizedAlias)],
-);
-
-export const firmEventTypeEnum = pgEnum("firm_event_type", ["acquired_by", "renamed", "merged"]);
-
-// M&A/rebrand history (spec 7.3 step 3, "walk firm_events for acquisitions
-// and rebrands"). counterpartyFirmId is the acquirer/new-name firm; the
-// resolver walks acquired_by edges to the current owner and applies the
-// OQ 2 eligibility-transition rule against announcedAt/effectiveAt.
-export const firmEvents = pgTable(
-  "firm_events",
-  {
-    id: uuid("id").primaryKey().defaultRandom(),
-    firmId: uuid("firm_id")
-      .notNull()
-      .references(() => firms.id),
-    eventType: firmEventTypeEnum("event_type").notNull(),
-    counterpartyFirmId: uuid("counterparty_firm_id").references(() => firms.id),
-    announcedAt: timestamp("announced_at", { withTimezone: true }),
-    effectiveAt: timestamp("effective_at", { withTimezone: true }),
-    sourceUrl: text("source_url"),
-  },
-  (table) => [index("firm_events_firm_idx").on(table.firmId)],
-);
-
-export const candidateSourceEnum = pgEnum("candidate_source", [
-  "sourced",
-  "referral",
-  "inbound",
-  "migrated",
-]);
-
-// firm_resolution_method mirrors resolver.ts's ResolutionMethod, plus
-// "manual" for when a human picked the firm directly from the dropdown
-// instead of accepting (or in place of) the resolver's suggestion.
-export const firmResolutionMethodEnum = pgEnum("firm_resolution_method", [
-  "exact",
-  "alias",
-  "fuzzy",
-  "manual",
-]);
-
-// Phase 3 fields beyond the MVP cut. Deliberately still missing
-// eligibility_status/eligibility_reason from the full spec 5 table -- those
-// require the Phase 8 eligibility engine (Top 100 + off-limits gate) to
-// mean anything; adding empty columns for a computation that doesn't exist
-// yet would be a misleading placeholder, not a head start.
-export const candidates = pgTable(
-  "candidates",
-  {
-    id: uuid("id").primaryKey().defaultRandom(),
-    fullName: text("full_name").notNull(),
-    preferredName: text("preferred_name"),
-    currentTitle: text("current_title"),
-    currentFirmRaw: text("current_firm_raw"),
-    resolvedFirmId: uuid("resolved_firm_id").references(() => firms.id),
-    // Populated by src/firms/resolver.ts (resolveFirm()) on create/edit when
-    // resolvedFirmId wasn't picked by hand -- "manual" + 1.0 when it was.
-    // Null resolvedFirmId with a non-null method means the resolver ran but
-    // requiresManualConfirmation() was true, so nothing was auto-applied.
-    firmResolutionConfidence: doublePrecision("firm_resolution_confidence"),
-    firmResolutionMethod: firmResolutionMethodEnum("firm_resolution_method"),
-    specialty: text("specialty"),
-    location: text("location"),
-    timezone: text("timezone"),
-    seniority: text("seniority"),
-    linkedinUrl: text("linkedin_url"),
-    source: candidateSourceEnum("source").notNull().default("sourced"),
-    summary: text("summary"),
+      .references(() => organization.id),
+    primaryName: text("primary_name").notNull(),
+    // Maintained by src/identity/normalize.ts on every insert/update -- the
+    // deterministic-match tier's exact-match target (spec 3.2 step 1 is
+    // identifier-based, but normalizedNameKey backs the fuzzy tier's
+    // "matching current employer" comparison and the merge queue's display).
+    normalizedNameKey: text("normalized_name_key").notNull(),
+    // A cheap collision-narrowing key (e.g. normalized name + first 3 chars
+    // of current employer) so the fuzzy match query in
+    // src/identity/resolver.ts doesn't have to pg_trgm-compare against the
+    // whole table -- narrows candidates before the expensive similarity()
+    // call. Recomputed whenever primaryName or current employment changes.
+    dedupFingerprint: text("dedup_fingerprint"),
     doNotContact: boolean("do_not_contact").notNull().default(false),
     dncReason: text("dnc_reason"),
     dncSetAt: timestamp("dnc_set_at", { withTimezone: true }),
-    // Soft merge (spec 3.6: "Merges and deletions are soft and reversible
-    // for 90 days"). A non-null value means this row is the "loser" of a
-    // merge; its own data stays intact for the reversibility window rather
-    // than being deleted or overwritten.
-    mergedIntoId: uuid("merged_into_id").references((): AnyPgColumn => candidates.id),
-    createdBy: uuid("created_by").references(() => users.id),
+    // Where this row came from: 'narrow_import', 'manual', 'merge_survivor'.
+    // Free text, not an enum -- import sources will grow (spec section 10)
+    // and this is provenance metadata, not a business rule.
+    createdFrom: text("created_from").notNull().default("manual"),
+    // Section 6: "MVP records retention_reviewed_at so the [retention] job
+    // can be added later without losing the ability to identify stale
+    // records." Deliberately unpopulated by any automated job in Phase 1.
+    retentionReviewedAt: timestamp("retention_reviewed_at", { withTimezone: true }),
+    createdBy: uuid("created_by").references(() => appUser.id),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-    // search_vector (tsvector, spec 5) is deliberately NOT modeled here.
-    // It's a Postgres GENERATED ALWAYS AS ... STORED column maintained
-    // entirely by the database (migrations/0005) -- application code never
-    // writes it and only ever reads through it via the raw
-    // websearch_to_tsquery() match in listCandidates() (src/candidates/
-    // queries.ts), so there's no drizzle-orm column type for it to get
-    // right or wrong.
-  },
-  (table) => [index("candidates_merged_into_idx").on(table.mergedIntoId)],
-);
-
-export const claimStatusEnum = pgEnum("claim_status", ["active", "released"]);
-export const claimBasisEnum = pgEnum("claim_basis", ["first_touch", "manual_override"]);
-
-// One active claim per candidate (spec 8.2). The partial unique index below
-// is the actual enforcement -- it holds under concurrent claim attempts,
-// which a `SELECT then INSERT` check in application code would not.
-export const candidateClaims = pgTable(
-  "candidate_claims",
-  {
-    id: uuid("id").primaryKey().defaultRandom(),
-    candidateId: uuid("candidate_id")
-      .notNull()
-      .references(() => candidates.id),
-    ownerUserId: uuid("owner_user_id")
-      .notNull()
-      .references(() => users.id),
-    claimBasis: claimBasisEnum("claim_basis").notNull().default("first_touch"),
-    status: claimStatusEnum("status").notNull().default("active"),
-    claimedAt: timestamp("claimed_at", { withTimezone: true }).notNull().defaultNow(),
-    releasedAt: timestamp("released_at", { withTimezone: true }),
-    releaseReason: text("release_reason"),
   },
   (table) => [
-    uniqueIndex("candidate_claims_one_active_idx")
-      .on(table.candidateId)
-      .where(sql`${table.status} = 'active'`),
+    index("person_normalized_name_idx").on(table.normalizedNameKey),
+    index("person_dedup_fingerprint_idx").on(table.dedupFingerprint),
   ],
 );
 
-// The collision firewall (spec 8.2, "Global cooldown independent of
-// ownership"): every outbound touch by anyone, checked before the next one
-// is allowed. This MVP only logs manual touches (call/email/linkedin/note)
-// via the UI -- there is no real send pipeline yet (Phases 6-13).
-export const contactChannelEnum = pgEnum("contact_channel", ["call", "email", "linkedin", "note"]);
-
-export const contactLedger = pgTable("contact_ledger", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  candidateId: uuid("candidate_id")
-    .notNull()
-    .references(() => candidates.id),
-  userId: uuid("user_id")
-    .notNull()
-    .references(() => users.id),
-  channel: contactChannelEnum("channel").notNull(),
-  outcome: text("outcome"),
-  occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull().defaultNow(),
-});
-
-export const GLOBAL_CONTACT_COOLDOWN_DAYS = 90;
-
-// --- Phase 3: engagements, documents, activities ---------------------------
-
-export const engagementTypeEnum = pgEnum("engagement_type", ["retained", "contingent", "consulting"]);
-export const engagementStatusEnum = pgEnum("engagement_status", ["active", "completed", "lapsed"]);
-export const offLimitsScopeEnum = pgEnum("off_limits_scope", [
-  "firm_wide",
-  "division",
-  "named_individuals",
-  "none",
+export const personIdentifierTypeEnum = pgEnum("person_identifier_type", [
+  "email",
+  "phone",
+  "linkedin_url",
+  "legacy_id",
 ]);
 
-// Client engagements (spec 5, "Firms and clients"). This is the record only
-// -- Phase 3 scope is "firm and engagement records," not the enforcement
-// gate. off_limits_scope/off_limits_expires_at are captured here now
-// because they're just data about the engagement, but nothing yet reads
-// them to actually block a claim or a send: that gate (spec 8.1,
-// "candidates at this firm are off-limits because of this engagement") is
-// explicitly Phase 5 work. Wiring it in early would mean guessing at how
-// Phase 5's eligibility pipeline wants to consume it.
-export const engagements = pgTable("engagements", {
+// Deterministic-match tier (spec 3.2 step 1): "Deterministic match on any
+// normalized person_identifier. Email and LinkedIn URL are near-certain.
+// Auto-merge." The UNIQUE(type, normalized_value) constraint IS that tier --
+// an insert that would collide is the match, not a query the app has to get
+// right every time.
+export const personIdentifier = pgTable(
+  "person_identifier",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    personId: uuid("person_id")
+      .notNull()
+      .references(() => person.id),
+    type: personIdentifierTypeEnum("type").notNull(),
+    value: text("value").notNull(),
+    normalizedValue: text("normalized_value").notNull(),
+    isPrimary: boolean("is_primary").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("person_identifier_type_normalized_unique_idx").on(table.type, table.normalizedValue),
+    index("person_identifier_person_idx").on(table.personId),
+  ],
+);
+
+// --- Brokerage, client, contract, job, engagement, placement ---------------
+
+// spec 3.1: "brokerage.rank is operationally load-bearing. The firm only
+// contacts candidates inside the top 100 brokerages. Store rank with
+// rank_as_of and snapshot it onto the engagement at sourcing time so
+// eligibility stays auditable when rankings shift."
+export const brokerage = pgTable(
+  "brokerage",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organization.id),
+    name: text("name").notNull(),
+    normalizedName: text("normalized_name").notNull(),
+    rank: integer("rank"),
+    rankSource: text("rank_source"),
+    rankAsOf: timestamp("rank_as_of", { withTimezone: true }),
+    isClient: boolean("is_client").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [uniqueIndex("brokerage_normalized_name_unique_idx").on(table.normalizedName)],
+);
+
+export const personEmploymentSourceEnum = pgEnum("person_employment_source", [
+  "narrow_import",
+  "manual",
+  "resume_parse",
+]);
+
+export const personEmployment = pgTable(
+  "person_employment",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    personId: uuid("person_id")
+      .notNull()
+      .references(() => person.id),
+    employerName: text("employer_name").notNull(),
+    brokerageId: uuid("brokerage_id").references(() => brokerage.id),
+    title: text("title"),
+    isCurrent: boolean("is_current").notNull().default(true),
+    // Section 8: candidate comp data access is restricted and audited on
+    // read. See src/compensation/reads.ts and 0007_permissions_rls.sql --
+    // direct SELECT on this column is revoked from the app role; reads go
+    // through a SECURITY DEFINER function that writes audit_log.
+    comp: jsonb("comp"),
+    bookOfBusiness: jsonb("book_of_business"),
+    source: personEmploymentSourceEnum("source").notNull().default("manual"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("person_employment_person_idx").on(table.personId)],
+);
+
+// spec 3.2 step 2: "Strong fuzzy match: pg_trgm name similarity plus
+// matching current employer. Surface in a merge review queue. Never
+// auto-merge." Merges are reversible (reversedAt) and never destructive --
+// absorbedSnapshot holds the full pre-merge state of the absorbed person
+// plus its identifiers/employment, so a reversal doesn't have to
+// reconstruct anything.
+export const personMerge = pgTable(
+  "person_merge",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    survivingPersonId: uuid("surviving_person_id")
+      .notNull()
+      .references(() => person.id),
+    absorbedPersonId: uuid("absorbed_person_id")
+      .notNull()
+      .references(() => person.id),
+    absorbedSnapshot: jsonb("absorbed_snapshot").notNull(),
+    mergedBy: uuid("merged_by").references(() => appUser.id),
+    mergedAt: timestamp("merged_at", { withTimezone: true }).notNull().defaultNow(),
+    reversedAt: timestamp("reversed_at", { withTimezone: true }),
+    reversedBy: uuid("reversed_by").references(() => appUser.id),
+  },
+  (table) => [index("person_merge_surviving_idx").on(table.survivingPersonId)],
+);
+
+export const clientTierEnum = pgEnum("client_tier", ["strategic", "standard", "prospect"]);
+export const clientStatusEnum = pgEnum("client_status", ["active", "inactive"]);
+
+export const client = pgTable("client", {
   id: uuid("id").primaryKey().defaultRandom(),
-  firmId: uuid("firm_id")
+  brokerageId: uuid("brokerage_id")
     .notNull()
-    .references(() => firms.id),
-  engagementType: engagementTypeEnum("engagement_type").notNull().default("retained"),
-  status: engagementStatusEnum("status").notNull().default("active"),
-  startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
-  endedAt: timestamp("ended_at", { withTimezone: true }),
-  offLimitsScope: offLimitsScopeEnum("off_limits_scope").notNull().default("firm_wide"),
-  offLimitsExpiresAt: timestamp("off_limits_expires_at", { withTimezone: true }),
-  termsNotes: text("terms_notes"),
-  createdBy: uuid("created_by").references(() => users.id),
+    .references(() => brokerage.id),
+  tier: clientTierEnum("tier").notNull().default("standard"),
+  ownerUserId: uuid("owner_user_id").references(() => appUser.id),
+  status: clientStatusEnum("status").notNull().default("active"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
-export const documentTypeEnum = pgEnum("document_type", ["resume", "attachment", "note_file"]);
+export const feeModelEnum = pgEnum("fee_model", ["contingency", "retained", "hourly"]);
+export const feeBasisEnum = pgEnum("fee_basis", ["first_year_cash", "total_comp", "flat"]);
+
+// section 8: recruiters cannot see feePercent. Enforced by column-level
+// privilege revocation in 0007_permissions_rls.sql, not just a UI omission.
+export const clientContract = pgTable("client_contract", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  clientId: uuid("client_id")
+    .notNull()
+    .references(() => client.id),
+  feeModel: feeModelEnum("fee_model").notNull().default("contingency"),
+  feePercent: doublePrecision("fee_percent"),
+  feeBasis: feeBasisEnum("fee_basis").notNull().default("first_year_cash"),
+  guaranteeDays: integer("guarantee_days").notNull().default(90),
+  paymentTermsDays: integer("payment_terms_days").notNull().default(30),
+  effectiveFrom: timestamp("effective_from", { withTimezone: true }).notNull().defaultNow(),
+  effectiveTo: timestamp("effective_to", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const jobStatusEnum = pgEnum("job_status", ["open", "on_hold", "filled", "cancelled"]);
+
+export const job = pgTable("job", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  clientId: uuid("client_id")
+    .notNull()
+    .references(() => client.id),
+  contractId: uuid("contract_id").references(() => clientContract.id),
+  title: text("title").notNull(),
+  status: jobStatusEnum("status").notNull().default("open"),
+  feeOverride: doublePrecision("fee_override"),
+  targetCompRangeMin: integer("target_comp_range_min"),
+  targetCompRangeMax: integer("target_comp_range_max"),
+  ownerUserId: uuid("owner_user_id").references(() => appUser.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+// Section 5 DECISION 2: nine stages, interview rounds as events inside
+// client_process rather than their own stages. The state machine ENGINE
+// (auto-generated tasks, SLA breach exceptions, transition guards -- spec
+// 5.2/5.3) is Phase 3 scope; this column exists in Phase 1 so the narrow
+// importer has somewhere to put each imported engagement's current stage.
+// No automation reads or writes it yet beyond the importer and manual edits.
+export const engagementStageEnum = pgEnum("engagement_stage", [
+  "sourced",
+  "outreach",
+  "engaged",
+  "qualified",
+  "submitted",
+  "client_process",
+  "offer",
+  "placed",
+  "secured",
+  "candidate_declined",
+  "client_rejected",
+  "withdrawn",
+  "on_hold",
+  "fell_off",
+]);
+
+export const engagementStatusEnum = pgEnum("engagement_status", ["active", "closed"]);
+
+export const engagement = pgTable(
+  "engagement",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    personId: uuid("person_id")
+      .notNull()
+      .references(() => person.id),
+    jobId: uuid("job_id")
+      .notNull()
+      .references(() => job.id),
+    currentStage: engagementStageEnum("current_stage").notNull().default("sourced"),
+    stageEnteredAt: timestamp("stage_entered_at", { withTimezone: true }).notNull().defaultNow(),
+    ownerUserId: uuid("owner_user_id").references(() => appUser.id),
+    sourcerUserId: uuid("sourcer_user_id").references(() => appUser.id),
+    status: engagementStatusEnum("status").notNull().default("active"),
+    roundNumber: integer("round_number").notNull().default(0),
+    roundsExpected: integer("rounds_expected"),
+    nextActionDueAt: timestamp("next_action_due_at", { withTimezone: true }),
+    expectedFee: doublePrecision("expected_fee"),
+    // Snapshotted from brokerage.rank at sourcing time (spec 3.1) so
+    // eligibility stays auditable when the Top 100 list is refreshed later.
+    brokerageRankSnapshot: integer("brokerage_rank_snapshot"),
+    createdBy: uuid("created_by").references(() => appUser.id),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("engagement_person_job_unique_idx").on(table.personId, table.jobId),
+    index("engagement_owner_idx").on(table.ownerUserId),
+    index("engagement_stage_idx").on(table.currentStage),
+  ],
+);
+
+export const placementStatusEnum = pgEnum("placement_status", ["pending_start", "started", "fell_off", "secured"]);
+
+// spec 3.1 groups placement with engagement, not with the 3.4 money ledger
+// -- it's the fact of a placement and its agreed terms, not the fee/invoice/
+// payment/commission ledger itself (Phase 2). fee_amount here is the
+// agreed placement fee; fee.gross_amount (Phase 2) is the recognized ledger
+// entry derived from it.
+export const placement = pgTable("placement", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  engagementId: uuid("engagement_id")
+    .notNull()
+    .unique()
+    .references(() => engagement.id),
+  startDate: timestamp("start_date", { withTimezone: true }),
+  guaranteedThrough: timestamp("guaranteed_through", { withTimezone: true }),
+  acceptedComp: jsonb("accepted_comp"),
+  feeAmount: doublePrecision("fee_amount"),
+  feeCalcSnapshot: jsonb("fee_calc_snapshot"),
+  status: placementStatusEnum("status").notNull().default("pending_start"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+// --- Process tables: event, task, exception, audit_log, activity_note ------
+// Spec 3.3: "not deferrable -- missing events cannot be invented later."
+// event is the spine every inbound signal becomes before anything else
+// happens. task/exception/activity_note are created here as schema now
+// (cheap, and 3.3 groups them as one non-deferrable unit) but nothing
+// generates or reads them yet in Phase 1 beyond the narrow importer
+// occasionally writing an activity_note -- the state machine (task
+// auto-generation, SLA exceptions) is Phase 3.
+
+export const eventSourceEnum = pgEnum("event_source", [
+  "narrow_import",
+  "manual_ui",
+  "email_ingest",
+  "calendar_sync",
+  "system",
+]);
+
+// Append-only, same lockdown pattern as audit_log (0005_process_tables.sql
+// REVOKEs UPDATE/DELETE and adds a trigger). external_id backs the
+// idempotency requirement -- an import or a webhook can retry safely.
+export const event = pgTable(
+  "event",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    type: text("type").notNull(),
+    source: eventSourceEnum("source").notNull(),
+    entityType: text("entity_type").notNull(),
+    entityId: text("entity_id").notNull(),
+    payload: jsonb("payload").notNull(),
+    occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
+    ingestedAt: timestamp("ingested_at", { withTimezone: true }).notNull().defaultNow(),
+    externalId: text("external_id"),
+  },
+  (table) => [
+    uniqueIndex("event_external_id_unique_idx").on(table.externalId).where(sql`${table.externalId} IS NOT NULL`),
+    index("event_entity_idx").on(table.entityType, table.entityId),
+    index("event_occurred_at_idx").on(table.occurredAt),
+  ],
+);
+
+export const taskTypeEnum = pgEnum("task_type", ["manual", "system_generated"]);
+
+export const task = pgTable(
+  "task",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    engagementId: uuid("engagement_id").references(() => engagement.id),
+    type: text("type").notNull(),
+    taskKind: taskTypeEnum("task_kind").notNull().default("manual"),
+    assigneeUserId: uuid("assignee_user_id").references(() => appUser.id),
+    dueAt: timestamp("due_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    completedBy: uuid("completed_by").references(() => appUser.id),
+    autoGenerated: boolean("auto_generated").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("task_engagement_idx").on(table.engagementId)],
+);
+
+export const exceptionSeverityEnum = pgEnum("exception_severity", ["low", "medium", "high"]);
+
+export const exception = pgTable(
+  "exception",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    ruleId: text("rule_id").notNull(),
+    entityType: text("entity_type").notNull(),
+    entityId: text("entity_id").notNull(),
+    severity: exceptionSeverityEnum("severity").notNull().default("medium"),
+    revenueAtRisk: doublePrecision("revenue_at_risk"),
+    openedAt: timestamp("opened_at", { withTimezone: true }).notNull().defaultNow(),
+    resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+    resolution: text("resolution"),
+    snoozedUntil: timestamp("snoozed_until", { withTimezone: true }),
+  },
+  (table) => [index("exception_entity_idx").on(table.entityType, table.entityId)],
+);
+
+// Append-only, same lockdown as event (0005). "Cannot reconstruct who did
+// what" -- section 0's own worked example of a non-deferrable item.
+export const auditLog = pgTable(
+  "audit_log",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    actorUserId: uuid("actor_user_id").references(() => appUser.id),
+    action: text("action").notNull(),
+    entityType: text("entity_type").notNull(),
+    entityId: text("entity_id").notNull(),
+    before: jsonb("before"),
+    after: jsonb("after"),
+    at: timestamp("at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("audit_log_entity_idx").on(table.entityType, table.entityId),
+    index("audit_log_at_idx").on(table.at),
+  ],
+);
+
+export const activityNote = pgTable(
+  "activity_note",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    entityType: text("entity_type").notNull(),
+    entityId: text("entity_id").notNull(),
+    authorUserId: uuid("author_user_id").references(() => appUser.id),
+    body: text("body").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("activity_note_entity_idx").on(table.entityType, table.entityId)],
+);
+
+// --- Documents ---------------------------------------------------------------
+
+export const documentKindEnum = pgEnum("document_kind", [
+  "resume",
+  "contract",
+  "submittal",
+  "transcript",
+  "other",
+]);
 export const documentParseStatusEnum = pgEnum("document_parse_status", [
   "pending",
   "parsed",
@@ -338,72 +472,91 @@ export const documentParseStatusEnum = pgEnum("document_parse_status", [
   "not_applicable",
 ]);
 
-// Spec 3.7 + 5: "Documents in S3-compatible storage... Never on the app
-// filesystem." Phase 3 scope is upload and view only -- parseStatus stays
-// "pending" (or "not_applicable" for non-resume attachments) until Phase 7
-// wires up actual text extraction. extractedText is nullable and unused
-// until then; the column exists now because it's part of the one documents
-// table the spec defines, not because anything populates it yet.
-export const documents = pgTable(
-  "documents",
+// Supabase Storage, signed URLs only (spec section 2, section 6). storagePath
+// is the object key inside the documents bucket; the app never serves a
+// public URL -- see src/storage/documents.ts.
+export const documentFile = pgTable(
+  "document_file",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    candidateId: uuid("candidate_id")
-      .notNull()
-      .references(() => candidates.id),
-    docType: documentTypeEnum("doc_type").notNull(),
-    storageKey: text("storage_key").notNull(),
+    entityType: text("entity_type").notNull(),
+    entityId: text("entity_id").notNull(),
+    storagePath: text("storage_path").notNull(),
     filename: text("filename").notNull(),
     mimeType: text("mime_type").notNull(),
-    sizeBytes: integer("size_bytes").notNull(),
-    checksumSha256: text("checksum_sha256").notNull(),
-    version: integer("version").notNull().default(1),
-    parsedAt: timestamp("parsed_at", { withTimezone: true }),
+    kind: documentKindEnum("kind").notNull(),
+    parsedProfile: jsonb("parsed_profile"),
     parseStatus: documentParseStatusEnum("parse_status").notNull().default("pending"),
-    extractedText: text("extracted_text"),
-    uploadedBy: uuid("uploaded_by").references(() => users.id),
+    checksumSha256: text("checksum_sha256").notNull(),
+    uploadedBy: uuid("uploaded_by").references(() => appUser.id),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [index("documents_candidate_idx").on(table.candidateId)],
+  (table) => [index("document_file_entity_idx").on(table.entityType, table.entityId)],
 );
 
-export const activityTypeEnum = pgEnum("activity_type", [
-  "call",
-  "note",
-  "meeting",
-  "email",
-  "linkedin",
-  "stage_change",
-  "system",
-]);
-export const activityDirectionEnum = pgEnum("activity_direction", ["inbound", "outbound"]);
-
-// The unified timeline (spec 5: "activities... calls, notes, meetings,
-// emails, messages, all on one timeline"). Distinct from contact_ledger:
-// contact_ledger is the lean collision-check table (candidate_id, user_id,
-// channel, occurred_at -- just enough to answer "did anyone touch this
-// person recently"), activities is the rich human-readable record with a
-// subject/body. Logging a contact writes both (see
-// src/candidates/actions.ts) rather than trying to derive one from the
-// other. searchId/emailThreadId/providerMessageId stay null until Phases
-// 4 and 6 exist to populate them.
-export const activities = pgTable(
-  "activities",
+// --- Phase 1 import staging (additive, not part of spec section 3) ---------
+// DECISION 4 requires importing "placements from the last 24 months with
+// their fees, invoices, payments, and spreadsheet-calculated commissions...
+// needed for the shadow harness." DECISION 6 assigns building the actual
+// commission engine and its plan_version/commission_entry ledger to Phase
+// 2 ("derive commission rules from history, do not collect them up front").
+// A real commission_entry row requires a commission_plan_version, which
+// doesn't exist until Phase 2 encodes one -- so Phase 1 stages the raw
+// historical facts here instead of forcing them into a ledger shape that
+// isn't buildable yet. Phase 2 reads this table once, populates the real
+// fee/invoice/payment/commission_entry tables from it, and the shadow
+// harness diffs against legacyCommissionAmount. Disposable once Phase 2 has
+// consumed it -- passes DECISION 0's own test (backfillable, cut/replace
+// freely) unlike anything in spec section 3.
+export const legacyPlacementImport = pgTable(
+  "legacy_placement_import",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    candidateId: uuid("candidate_id")
-      .notNull()
-      .references(() => candidates.id),
-    searchId: uuid("search_id"), // FK added once `searches` exists (Phase 4)
-    userId: uuid("user_id").references(() => users.id),
-    activityType: activityTypeEnum("activity_type").notNull(),
-    direction: activityDirectionEnum("direction"),
-    occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull().defaultNow(),
-    subject: text("subject"),
-    body: text("body"),
-    emailThreadId: text("email_thread_id"),
-    providerMessageId: text("provider_message_id"),
-    isAutoCaptured: boolean("is_auto_captured").notNull().default(false),
+    externalId: text("external_id").notNull().unique(),
+    engagementId: uuid("engagement_id").references(() => engagement.id),
+    placementId: uuid("placement_id").references(() => placement.id),
+    recruiterEmail: text("recruiter_email"),
+    startDate: timestamp("start_date", { withTimezone: true }),
+    acceptedComp: jsonb("accepted_comp"),
+    feeAmount: doublePrecision("fee_amount"),
+    invoiceAmount: doublePrecision("invoice_amount"),
+    invoiceIssuedAt: timestamp("invoice_issued_at", { withTimezone: true }),
+    paymentAmount: doublePrecision("payment_amount"),
+    paymentReceivedAt: timestamp("payment_received_at", { withTimezone: true }),
+    legacyCommissionAmount: doublePrecision("legacy_commission_amount"),
+    rawRow: jsonb("raw_row").notNull(),
+    importedAt: timestamp("imported_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [index("activities_candidate_occurred_idx").on(table.candidateId, table.occurredAt)],
+  (table) => [index("legacy_placement_import_engagement_idx").on(table.engagementId)],
+);
+
+// --- Merge review queue (additive, see 0008_person_merge_candidate.sql) ----
+
+export const personMergeCandidateStatusEnum = pgEnum("person_merge_candidate_status", [
+  "pending",
+  "merged",
+  "rejected",
+]);
+
+export const personMergeCandidate = pgTable(
+  "person_merge_candidate",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    personAId: uuid("person_a_id")
+      .notNull()
+      .references(() => person.id),
+    personBId: uuid("person_b_id")
+      .notNull()
+      .references(() => person.id),
+    similarity: doublePrecision("similarity").notNull(),
+    matchedOn: text("matched_on").notNull(),
+    status: personMergeCandidateStatusEnum("status").notNull().default("pending"),
+    reviewedBy: uuid("reviewed_by").references(() => appUser.id),
+    reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("person_merge_candidate_pair_unique_idx").on(table.personAId, table.personBId),
+    index("person_merge_candidate_status_idx").on(table.status),
+  ],
 );

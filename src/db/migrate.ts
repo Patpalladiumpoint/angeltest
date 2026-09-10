@@ -4,10 +4,12 @@
 // and wraps each file in a transaction so a failure never leaves a
 // half-applied migration.
 //
-// Deliberately not drizzle-kit's own migrator: this project hand-writes SQL
-// migrations (see the README section "Why hand-written SQL migrations") so
-// the audit_log lockdown and role grants are explicit and reviewable rather
-// than generated.
+// Hand-written SQL migrations, not drizzle-kit's generated ones: the
+// audit_log/event lockdown, column-level permission revokes, and the DNC
+// trigger are security properties, not table shape -- they read better as
+// explicit, reviewable SQL than as codegen output. drizzle.config.ts is
+// still present so drizzle-kit studio / introspection tools work against
+// the resulting schema.
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import postgres from "postgres";
