@@ -90,8 +90,23 @@ async function resolveClient(tx: DbTx, brokerageId: string, tier: NarrowImportRo
   return created!;
 }
 
+// Real bug, caught live against Postgres: a bare .select()/.returning()
+// on client_contract or job requests every column, including
+// fee_percent/fee_override, which have table-level SELECT revoked from
+// palladium_app (migrations/0007) -- both the existing-row lookup and the
+// newly-inserted row would fail with "permission denied" the moment this
+// ran against a real database, on every row needing a first-time contract
+// or job. Only `.id` is ever used from either return value downstream
+// (see the two call sites), so both queries request only that column --
+// same fix shape as migration 0016's finance RETURNING fix, applied here
+// as a query-side change instead of a new grant, since job/client_contract
+// need `id` and nothing else from these two functions.
 async function resolveContract(tx: DbTx, clientId: string, row: NarrowImportRow) {
-  const [existing] = await tx.select().from(clientContract).where(eq(clientContract.clientId, clientId)).limit(1);
+  const [existing] = await tx
+    .select({ id: clientContract.id })
+    .from(clientContract)
+    .where(eq(clientContract.clientId, clientId))
+    .limit(1);
   if (existing) return existing;
 
   const [created] = await tx
@@ -102,13 +117,13 @@ async function resolveContract(tx: DbTx, clientId: string, row: NarrowImportRow)
       feePercent: row.contract_fee_percent ? Number(row.contract_fee_percent) : undefined,
       guaranteeDays: row.contract_guarantee_days ? Number(row.contract_guarantee_days) : 90,
     })
-    .returning();
+    .returning({ id: clientContract.id });
   return created!;
 }
 
 async function resolveJob(tx: DbTx, clientId: string, contractId: string, row: NarrowImportRow) {
   const [existing] = await tx
-    .select()
+    .select({ id: job.id })
     .from(job)
     .where(and(eq(job.clientId, clientId), eq(job.title, row.job_title)))
     .limit(1);
@@ -117,7 +132,7 @@ async function resolveJob(tx: DbTx, clientId: string, contractId: string, row: N
   const [created] = await tx
     .insert(job)
     .values({ clientId, contractId, title: row.job_title, status: row.job_status || "open" })
-    .returning();
+    .returning({ id: job.id });
   return created!;
 }
 

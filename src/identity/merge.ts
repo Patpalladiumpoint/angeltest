@@ -41,8 +41,31 @@ export async function mergePerson(
       .select()
       .from(personIdentifier)
       .where(eq(personIdentifier.personId, absorbedPersonId));
+    // Real bug, caught live against Postgres: a bare .select() here
+    // requests every column, including comp, which has table-level
+    // SELECT revoked from palladium_app (migrations/0007) -- this would
+    // fail with "permission denied" the moment a merge candidate with
+    // any employment history ran against a real database. Excluding comp
+    // fixes that *and* closes a latent privacy gap: the excluded columns
+    // are all that's needed to move rows and to describe them in
+    // absorbedSnapshot (below) -- embedding raw comp in that jsonb column
+    // would have been a second, unaudited copy of exactly the data
+    // get_person_employment_comp() exists to gate and log every read of.
+    // The comp figure itself is never lost -- it stays on the
+    // person_employment row, which is only re-pointed to the survivor's
+    // person_id, never deleted or rewritten.
     const absorbedEmployment = await tx
-      .select()
+      .select({
+        id: personEmployment.id,
+        personId: personEmployment.personId,
+        employerName: personEmployment.employerName,
+        brokerageId: personEmployment.brokerageId,
+        title: personEmployment.title,
+        isCurrent: personEmployment.isCurrent,
+        bookOfBusiness: personEmployment.bookOfBusiness,
+        source: personEmployment.source,
+        createdAt: personEmployment.createdAt,
+      })
       .from(personEmployment)
       .where(eq(personEmployment.personId, absorbedPersonId));
     const absorbedEngagements = await tx.select().from(engagement).where(eq(engagement.personId, absorbedPersonId));
