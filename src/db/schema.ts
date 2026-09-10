@@ -7,7 +7,9 @@ import {
   jsonb,
   integer,
   pgEnum,
+  uniqueIndex,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 
 // Phase 0 scope only: the tables every later phase depends on for identity,
 // audit, and runtime config. Candidate/firm/search/financial tables land in
@@ -74,3 +76,85 @@ export const auditLog = pgTable("audit_log", {
 });
 
 export const SYSTEM_SETTINGS_SINGLETON_ID = 1;
+
+// --- MVP slice: candidates, firms, ownership -------------------------------
+// Deliberately the smallest cut of spec section 5 that demonstrates the
+// firm's #1 stated problem -- collision -- with no LLM, no email sync, no
+// firm resolver, no eligibility/off-limits engine. Those are real later
+// phases (1, 2, 5, 6-9), not cut corners pretending to be finished: see
+// README "MVP scope" for exactly what this does and does not enforce yet.
+
+export const firmStatusEnum = pgEnum("firm_status", ["active", "acquired", "renamed"]);
+
+// A trimmed stand-in for the full spec 5 `firms` table (no aliases, no
+// firm_events, no parent-firm chain). Good enough to attach a candidate to
+// a firm by name; not good enough to run the real fuzzy resolver (Phase 1).
+export const firms = pgTable("firms", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  canonicalName: text("canonical_name").notNull(),
+  top100Rank: integer("top100_rank"),
+  status: firmStatusEnum("status").notNull().default("active"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const candidates = pgTable("candidates", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  fullName: text("full_name").notNull(),
+  currentTitle: text("current_title"),
+  currentFirmRaw: text("current_firm_raw"),
+  resolvedFirmId: uuid("resolved_firm_id").references(() => firms.id),
+  linkedinUrl: text("linkedin_url"),
+  doNotContact: boolean("do_not_contact").notNull().default(false),
+  createdBy: uuid("created_by").references(() => users.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const claimStatusEnum = pgEnum("claim_status", ["active", "released"]);
+export const claimBasisEnum = pgEnum("claim_basis", ["first_touch", "manual_override"]);
+
+// One active claim per candidate (spec 8.2). The partial unique index below
+// is the actual enforcement -- it holds under concurrent claim attempts,
+// which a `SELECT then INSERT` check in application code would not.
+export const candidateClaims = pgTable(
+  "candidate_claims",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    candidateId: uuid("candidate_id")
+      .notNull()
+      .references(() => candidates.id),
+    ownerUserId: uuid("owner_user_id")
+      .notNull()
+      .references(() => users.id),
+    claimBasis: claimBasisEnum("claim_basis").notNull().default("first_touch"),
+    status: claimStatusEnum("status").notNull().default("active"),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }).notNull().defaultNow(),
+    releasedAt: timestamp("released_at", { withTimezone: true }),
+    releaseReason: text("release_reason"),
+  },
+  (table) => [
+    uniqueIndex("candidate_claims_one_active_idx")
+      .on(table.candidateId)
+      .where(sql`${table.status} = 'active'`),
+  ],
+);
+
+// The collision firewall (spec 8.2, "Global cooldown independent of
+// ownership"): every outbound touch by anyone, checked before the next one
+// is allowed. This MVP only logs manual touches (call/email/linkedin/note)
+// via the UI -- there is no real send pipeline yet (Phases 6-13).
+export const contactChannelEnum = pgEnum("contact_channel", ["call", "email", "linkedin", "note"]);
+
+export const contactLedger = pgTable("contact_ledger", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  candidateId: uuid("candidate_id")
+    .notNull()
+    .references(() => candidates.id),
+  userId: uuid("user_id")
+    .notNull()
+    .references(() => users.id),
+  channel: contactChannelEnum("channel").notNull(),
+  outcome: text("outcome"),
+  occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const GLOBAL_CONTACT_COOLDOWN_DAYS = 90;

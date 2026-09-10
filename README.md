@@ -5,7 +5,7 @@ five-recruiter executive search desk covering the Business Insurance Top 100
 Brokers. Full spec: see the project brief this repo was built from (build
 order, data model, and guardrails).
 
-## Status: Phase 0 (Foundation and custody)
+## Status: Phase 0 (Foundation and custody) + an MVP slice
 
 Per the spec's build order, phases ship in sequence and each is
 independently demoable. **This repo currently implements Phase 0 only:**
@@ -32,10 +32,78 @@ independently demoable. **This repo currently implements Phase 0 only:**
 
 Everything past Phase 0 (firm graph, migration, candidate/search records,
 ownership, email, research, drafting, review, send, LinkedIn, cadences,
-reporting) is **not built yet**. Building it before custody was solid would
-have meant building business-critical infrastructure on an unverified
-foundation — the spec calls this out explicitly ("Do not skip the custody
-work. It is cheap now and expensive later.").
+reporting) was **not built yet at that point**. Building it before custody
+was solid would have meant building business-critical infrastructure on an
+unverified foundation — the spec calls this out explicitly ("Do not skip
+the custody work. It is cheap now and expensive later.").
+
+## MVP slice: candidates, firms, and the collision gate
+
+On top of Phase 0, this repo also has a deliberately small, real, clickable
+slice: **candidates, firms, ownership claims, and the contact-ledger
+cooldown** — the smallest cut that demonstrates the firm's #1 stated problem
+(collision: two recruiters touching the same candidate) with **no LLM, no
+email integration, no firm resolver**. The spec calls this combination
+"fastest real value in the build" (Phase 5) precisely because it needs none
+of that.
+
+What it does:
+
+- `/candidates` — list every candidate (owner and last-contact visible to
+  everyone, on purpose — spec 5: "Opacity is what created the collision
+  problem"), and a quick-add form.
+- `/candidates/[id]` — claim a candidate, log a contact, see full contact
+  history.
+- `/firms` — a minimal firm list/add (no aliases, no fuzzy resolver — see
+  "What's stubbed" below).
+- **The actual guardrails, not just UI:**
+  - One active claim per candidate, enforced by a partial unique index —
+    proven under a real concurrent-insert race in this session (two
+    simultaneous claims on the same candidate; exactly one wins, the other
+    gets `23505 duplicate key value`).
+  - The 90-day global contact cooldown (spec 8.2: "no candidate receives
+    outbound from anyone within 90 days of the last outbound, even the same
+    owner on a different search") is checked at the moment of logging
+    contact, names who blocked it and when, and writes a
+    `collision_blocked` audit row (feeds the "Collision events blocked"
+    report metric in spec section 9, once reporting exists).
+  - First-touch auto-claim on the first logged contact, same
+    partial-unique-index guarantee against the same race.
+  - `do_not_contact` hard-stops logging.
+
+**What's stubbed, on purpose, for "quick":**
+
+- No firm resolver (Phase 1) — firms are hand-entered, no aliases/fuzzy
+  matching/M&A chain.
+- No off-limits/eligibility engine (`engagements`, `firm_restrictions`) —
+  the collision gate is the *global* cooldown only, not the full spec 8.1
+  eligibility pipeline.
+- No claim expiry/exclusivity window, no override flow — claims just sit
+  `active` until manually contested.
+- No migration, no email, no outreach/drafting/send, no financials.
+
+None of this is a shortcut on the guardrails that do exist — the parts that
+are built (append-only audit log, one-active-claim, the cooldown gate) are
+real database-level guarantees, verified against a running Postgres, not
+mocked or faked for the demo.
+
+### Trying it locally
+
+```bash
+npm install
+npm run db:migrate
+SEED_ADMIN_EMAIL=you@palladiumpoint.com SEED_RECRUITER_EMAILS=a@x.com,b@x.com npm run db:seed
+npm run dev
+```
+
+Open `/sign-in` and use the **dev sign-in** box (email only, no password) to
+sign in as any seeded user — this path only exists when
+`NODE_ENV !== "production"` (see `src/auth/config.ts`) and is not a
+real-auth fallback, just a way to click through the app without registering
+a Google/Microsoft OAuth app first. To see the collision gate fire: sign in
+as `a@x.com`, add a candidate, log a contact; sign out, sign in as `b@x.com`,
+try to log a contact on the same candidate within 90 days — it's blocked and
+names `a@x.com` and the timestamp.
 
 ## Why hand-written SQL migrations
 
@@ -108,6 +176,12 @@ Postgres 16 instance with `psql`, `pg_dump`, and `pg_restore`:
   detect orphaned rows.
 - The export command's primary-key detection and row-to-JSON shape were
   checked against `information_schema` and `row_to_json` directly.
+- The MVP's one-active-claim guarantee was proven under an actual
+  concurrent race (two simultaneous `INSERT`s on the same candidate from
+  two parallel `psql` processes — exactly one succeeds, the other fails
+  with `23505 duplicate key value`), and the collision-cooldown query and
+  the unclaimed-candidate left-join were both run directly against
+  Postgres with the exact SQL the Drizzle query builder produces.
 
 What was **not** run in this session: `npm install`, `next build`, `tsc`
 against the real dependency graph, or `vitest` itself, since none of those

@@ -1,6 +1,7 @@
 import type { AuthOptions } from "next-auth";
 import GoogleProvider from "next-auth/providers/google";
 import AzureADProvider from "next-auth/providers/azure-ad";
+import CredentialsProvider from "next-auth/providers/credentials";
 import { db } from "@/db/client";
 import { users } from "@/db/schema";
 import { eq } from "drizzle-orm";
@@ -35,6 +36,29 @@ if (
       clientId: process.env.MICROSOFT_CLIENT_ID,
       clientSecret: process.env.MICROSOFT_CLIENT_SECRET,
       tenantId: process.env.MICROSOFT_TENANT_ID,
+    }),
+  );
+}
+
+// Dev-only identity picker: NOT an SSO provider and NOT a password. It
+// exists so this MVP is clickable without registering a real Google/
+// Microsoft OAuth app first -- pick a seeded user by email, nothing is
+// verified. Hard-gated to non-production so it can never become a real
+// auth bypass; the real SSO providers above are what actually ships (spec
+// section 4, "No local passwords").
+if (process.env.NODE_ENV !== "production") {
+  providers.push(
+    CredentialsProvider({
+      id: "dev-picker",
+      name: "Dev: pick a seeded user",
+      credentials: { email: { label: "Email", type: "text" } },
+      async authorize(credentials) {
+        const email = credentials?.email?.trim();
+        if (!email) return null;
+        const [existing] = await db.select().from(users).where(eq(users.email, email));
+        if (!existing?.isActive) return null;
+        return { id: existing.id, email: existing.email, name: existing.name };
+      },
     }),
   );
 }
