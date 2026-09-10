@@ -19,6 +19,7 @@
     "db:seed": "tsx src/db/seed.ts",
     "import:narrow": "tsx src/import/runNarrowImport.ts",
     "dataquality:report": "tsx src/dataquality/report.ts",
+    "portal:seed-demo-contact": "tsx src/portal/seedContacts.ts",
     "backup:run": "tsx src/custody/backup.ts",
     "backup:restore-drill": "tsx src/custody/restoreDrill.ts",
     "export:run": "tsx src/custody/export.ts"

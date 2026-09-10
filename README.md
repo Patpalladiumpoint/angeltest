@@ -5,6 +5,37 @@ process state, and commission ledger. Built from `PALLADIUM_OS_MVP_SPEC.md`
 v3.0 -- an 11-week, phased MVP build. This repo currently implements
 **Phase 1: foundation and narrow import** only.
 
+## UI and the client portal (additive, not part of v3.0 spec)
+
+Two product additions on top of Phase 1, built with a shared design system
+(`src/app/globals.css` -- same navy/paper/brass token family as the
+[palladiumpoint.com marketing site](https://claude.ai/code/artifact/edfde39b-3a0f-4ddf-b870-03ccbdb6474a),
+hand-written since this sandbox can't `npx shadcn init` or run a Tailwind
+build; see "A note on this session's constraints"):
+
+- **The internal app has a real visual design now.** `/dashboard` is the
+  Pipeline view (KPI strip + an active-engagements table --
+  `src/engagements/queries.ts`), `/merge-queue` and the new `/data-quality`
+  (moved off `/dashboard`, see below) share the same sidebar shell
+  (`src/components/AppShell.tsx`).
+- **A client portal** (`/portal`, `src/portal/`) -- new, not in spec
+  section 3. A client contact (`client_contact`, migration `0009`, a
+  distinct identity space from `app_user`) sees only their own client's
+  jobs, and only engagements at `engaged` stage or later (never
+  `sourced`/`outreach` -- a product decision matching how a retained search
+  firm actually protects confidentiality, documented in
+  `src/portal/queries.ts`). **Money columns are unreadable from the portal
+  by construction, not by query discipline alone**: even a query that
+  joined from `client_contact` all the way to `client_contract.fee_percent`
+  was proven, directly against Postgres in this session, to fail with
+  `permission denied` -- the column-level lockdown from migration `0007`
+  protects any actor asking through `palladium_app`, portal included.
+  **Read `src/portal/session.ts`'s SECURITY NOTE before this goes near a
+  real client**: sign-in is unverified email entry, dev/demo-only, with no
+  production fallback yet (unlike the internal app's Supabase Auth path).
+  Seed a demo contact with `npm run portal:seed-demo-contact` after running
+  the narrow importer.
+
 ## Why this repo looks like a restart
 
 An earlier build in this repository's history targeted a different, older

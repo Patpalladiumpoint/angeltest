@@ -530,6 +530,26 @@ export const legacyPlacementImport = pgTable(
   (table) => [index("legacy_placement_import_engagement_idx").on(table.engagementId)],
 );
 
+// --- Client portal (additive, see 0009_client_contact.sql) -----------------
+// A distinct identity space from appUser -- a client contact is never a
+// recruiter/ops/exec. See the migration's comment for how scoping and the
+// money-column lockdown both hold for this new surface.
+
+export const clientContact = pgTable(
+  "client_contact",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    clientId: uuid("client_id")
+      .notNull()
+      .references(() => client.id),
+    email: text("email").notNull().unique(),
+    name: text("name").notNull(),
+    isActive: boolean("is_active").notNull().default(true),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("client_contact_client_idx").on(table.clientId)],
+);
+
 // --- Merge review queue (additive, see 0008_person_merge_candidate.sql) ----
 
 export const personMergeCandidateStatusEnum = pgEnum("person_merge_candidate_status", [

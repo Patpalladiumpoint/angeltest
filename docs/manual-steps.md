@@ -67,7 +67,22 @@ must set it up that way and periodically confirm it hasn't drifted.
 Eliminated by: nothing in-app can verify "this is actually a separate
 account" -- it's an infrastructure/ops discipline, not a code guarantee.
 
-## 5. `app_user` provisioning is manual, not self-serve
+## 5. Client portal auth is not production-safe yet
+
+`src/portal/session.ts` and `/portal/sign-in` accept any email that matches
+an active `client_contact` row, with **no verification step at all** -- not
+even the internal app's dev-sign-in has this gap, since the internal app's
+production path is real Supabase Auth Google SSO. Before any real client is
+given a portal URL: wire Supabase Auth magic-link (or another verified
+channel) to `client_contact.email`, and remove the plain-email sign-in
+path entirely rather than just gating it tighter.
+
+Eliminated by: replacing `src/app/portal/sign-in/actions.ts`'s
+`portalSignIn` with a real verified-auth flow. Nothing else in the portal
+(the client-side data scoping, the money-column lockdown) needs to change
+when that happens -- see `src/portal/queries.ts`'s header comment.
+
+## 6. `app_user` provisioning is manual, not self-serve
 
 Signing in with Google (once Supabase Auth is live) only succeeds for an
 email that already has an `app_user` row -- section 8's three roles are

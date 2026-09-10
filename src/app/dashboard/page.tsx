@@ -1,86 +1,123 @@
 import { redirect } from "next/navigation";
 import { getCurrentActor } from "@/auth/session";
-import { runDataQualityReport } from "@/dataquality/report";
+import { db } from "@/db/client";
+import { appUser } from "@/db/schema";
+import { eq } from "drizzle-orm";
+import { AppShell } from "@/components/AppShell";
+import { listActiveEngagements, getPipelineKpis, STALE_DAYS_THRESHOLD } from "@/engagements/queries";
 
-// Phase 1 week-2 deliverable: the data quality report, on a page a human
-// can actually look at. See src/dataquality/report.ts for what each
-// section means and why it's shaped this way.
+const STAGE_PILL: Record<string, string> = {
+  sourced: "pill-slate",
+  outreach: "pill-rust",
+  engaged: "pill-rust",
+  qualified: "pill-slate",
+  submitted: "pill-brass",
+  client_process: "pill-slate",
+  offer: "pill-brass",
+  placed: "pill-verdigris",
+  secured: "pill-verdigris",
+  candidate_declined: "pill-rust",
+  client_rejected: "pill-rust",
+  withdrawn: "pill-slate",
+  on_hold: "pill-amber",
+  fell_off: "pill-rust",
+};
+
+function stageLabel(stage: string): string {
+  return stage.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function initials(name: string): string {
+  return name.split(" ").map((p) => p[0]).join("").slice(0, 2).toUpperCase();
+}
+
+// The internal Pipeline view -- replaces the old bare data-quality dump at
+// this URL (that report now lives at /data-quality, still linked from the
+// sidebar). This is the page a recruiter actually opens dozens of times a
+// day, so it leads with the table, not a report.
 export default async function DashboardPage() {
   const actor = await getCurrentActor();
   if (!actor) redirect("/sign-in");
 
-  const report = await runDataQualityReport();
+  const [me] = await db.select({ name: appUser.name }).from(appUser).where(eq(appUser.id, actor.userId)).limit(1);
+  const [engagements, kpis] = await Promise.all([listActiveEngagements(), getPipelineKpis()]);
 
   return (
-    <main style={{ maxWidth: 960, margin: "0 auto", padding: 24 }}>
-      <h1>Data quality</h1>
-      <p>
-        <a href="/merge-queue">Merge review queue &rarr;</a>
-      </p>
+    <AppShell actor={actor} userName={me?.name ?? "You"} activeNav="pipeline" pageTitle="Pipeline" mergeQueueCount={kpis.pendingMerges}>
+      <div className="kpi-row">
+        <div className="card kpi">
+          <div className="kpi-label">Active Engagements</div>
+          <div className="kpi-value mono">{kpis.activeEngagements}</div>
+          <div className="kpi-sub">Across every open search</div>
+        </div>
+        <div className="card kpi">
+          <div className="kpi-label">Stalled &gt; {STALE_DAYS_THRESHOLD}d</div>
+          <div className={`kpi-value mono${kpis.stalledCount > 0 ? " warn" : ""}`}>{kpis.stalledCount}</div>
+          <div className="kpi-sub">Revenue at risk ${kpis.revenueAtRisk.toLocaleString()}</div>
+        </div>
+        <div className="card kpi">
+          <div className="kpi-label">Pending Merges</div>
+          <div className="kpi-value mono">{kpis.pendingMerges}</div>
+          <div className="kpi-sub">Strong-match candidates</div>
+        </div>
+        <div className="card kpi">
+          <div className="kpi-label">Placements — MTD</div>
+          <div className="kpi-value mono">{kpis.placementsMtd}</div>
+          <div className="kpi-sub">${kpis.placementsMtdFee.toLocaleString()} expected fee</div>
+        </div>
+      </div>
 
-      <Section title={`Unmappable stages (${report.unmappableStages.length})`}>
-        {report.unmappableStages.map((r) => (
-          <li key={r.externalId}>
-            {r.externalId}: &quot;{r.stage}&quot; at {r.occurredAt.toISOString()}
-          </li>
-        ))}
-      </Section>
-
-      <Section title={`Duplicate persons pending review (${report.duplicatePersons.length})`}>
-        {report.duplicatePersons.map((r) => (
-          <li key={`${r.personAId}-${r.personBId}`}>
-            {r.personAName} / {r.personBName} (similarity {r.similarity.toFixed(2)})
-          </li>
-        ))}
-      </Section>
-
-      <Section title={`Engagements with no owner (${report.ownerlessEngagements.length})`}>
-        {report.ownerlessEngagements.map((r) => (
-          <li key={r.engagementId}>
-            {r.personName} &mdash; {r.jobTitle} ({r.stage})
-          </li>
-        ))}
-      </Section>
-
-      <Section title={`Placements with no invoice (${report.placementsWithoutInvoice.length})`}>
-        {report.placementsWithoutInvoice.map((r) => (
-          <li key={r.placementId}>
-            {r.personName} &mdash; started {r.startDate?.toISOString().slice(0, 10) ?? "unknown"}
-          </li>
-        ))}
-      </Section>
-
-      <Section title={`Placements missing a start date (${report.missingStartDates.length})`}>
-        {report.missingStartDates.map((r) => (
-          <li key={r.placementId}>
-            {r.personName} &mdash; status {r.status}
-          </li>
-        ))}
-      </Section>
-
-      <Section title={`Stalled engagements, ranked by days idle x expected fee (${report.stalledEngagements.length})`}>
-        {report.stalledEngagements.map((r) => (
-          <li key={r.engagementId}>
-            {r.personName} &mdash; {r.jobTitle} ({r.stage}), {r.daysIdle}d idle, expected fee{" "}
-            {r.expectedFee ? `$${r.expectedFee.toLocaleString()}` : "unset"}, risk score {r.riskScore.toFixed(0)}
-          </li>
-        ))}
-      </Section>
-
-      <Section title={`Document parse failures (${report.parseFailures.length})`}>
-        {report.parseFailures.map((r) => (
-          <li key={r.documentId}>{r.filename}</li>
-        ))}
-      </Section>
-    </main>
-  );
-}
-
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <section style={{ marginTop: 24 }}>
-      <h2 style={{ fontSize: 16 }}>{title}</h2>
-      <ul>{children}</ul>
-    </section>
+      <div className="card">
+        <div className="panel-head">
+          <h2>Active Engagements</h2>
+          <span className="count mono">{engagements.length} total</span>
+        </div>
+        {engagements.length === 0 ? (
+          <div className="empty-state">No active engagements yet. Run the narrow importer or add one manually.</div>
+        ) : (
+          <div className="overflow-x">
+            <table className="eng-table">
+              <thead>
+                <tr>
+                  <th>Candidate</th>
+                  <th>Job</th>
+                  <th>Stage</th>
+                  <th>Owner</th>
+                  <th>Days in Stage</th>
+                  <th>Expected Fee</th>
+                </tr>
+              </thead>
+              <tbody>
+                {engagements.map((row) => (
+                  <tr key={row.engagementId}>
+                    <td>
+                      <div className="cand-cell">
+                        <div className="avatar">{initials(row.personName)}</div>
+                        <div>
+                          <span className="name">{row.personName}</span>
+                          {row.currentEmployer && <span className="sub">{row.currentEmployer}</span>}
+                        </div>
+                      </div>
+                    </td>
+                    <td>{row.jobTitle}</td>
+                    <td>
+                      <span className={`pill ${STAGE_PILL[row.currentStage] ?? "pill-slate"}`}>{stageLabel(row.currentStage)}</span>
+                    </td>
+                    <td>
+                      <div className="owner-cell">
+                        <div className="avatar sm">{row.ownerName ? initials(row.ownerName) : "—"}</div>
+                        {row.ownerName ?? "unassigned"}
+                      </div>
+                    </td>
+                    <td className={`idle-cell${row.daysInStage >= STALE_DAYS_THRESHOLD ? " hot" : ""}`}>{row.daysInStage}d</td>
+                    <td className="fee-cell">{row.expectedFee ? `$${row.expectedFee.toLocaleString()}` : "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </AppShell>
   );
 }
