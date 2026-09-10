@@ -3,10 +3,8 @@ import { redirect } from "next/navigation";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/auth/config";
 import { listFirms } from "@/candidates/queries";
-import { createFirmAction } from "@/candidates/actions";
+import { createFirmAction } from "@/firms/actions";
 
-// Trimmed stand-in for the full spec 5 firms table -- no aliases, no M&A
-// history, no fuzzy resolver. See README "MVP scope."
 export default async function FirmsPage() {
   const session = await getServerSession(authOptions);
   if (!session) redirect("/sign-in");
@@ -28,7 +26,9 @@ export default async function FirmsPage() {
         <tbody>
           {firms.map((f) => (
             <tr key={f.id}>
-              <td>{f.canonicalName}</td>
+              <td>
+                <Link href={`/firms/${f.id}`}>{f.canonicalName}</Link>
+              </td>
               <td>{f.top100Rank ?? "—"}</td>
               <td>{f.status}</td>
             </tr>

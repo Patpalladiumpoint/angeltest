@@ -7,6 +7,7 @@ import {
   jsonb,
   integer,
   bigint,
+  doublePrecision,
   pgEnum,
   uniqueIndex,
   index,
@@ -80,12 +81,14 @@ export const auditLog = pgTable("audit_log", {
 
 export const SYSTEM_SETTINGS_SINGLETON_ID = 1;
 
-// --- MVP slice: candidates, firms, ownership -------------------------------
-// Deliberately the smallest cut of spec section 5 that demonstrates the
-// firm's #1 stated problem -- collision -- with no LLM, no email sync, no
-// firm resolver, no eligibility/off-limits engine. Those are real later
-// phases (1, 2, 5, 6-9), not cut corners pretending to be finished: see
-// README "MVP scope" for exactly what this does and does not enforce yet.
+// --- Candidates, firms, ownership -------------------------------------------
+// Started as the smallest MVP cut of spec section 5 demonstrating the
+// firm's #1 stated problem -- collision -- with no LLM or email sync
+// involved. The firm graph/resolver (Phase 1) and eligibility/off-limits
+// engine below are now real: firms/firmAliases/firmEvents and the resolver
+// in src/firms/resolver.ts. Still not built: eligibility/off-limits gating
+// itself (Phase 5), LLM-driven outreach, and email sync -- see README for
+// exactly what each phase covers.
 
 export const firmStatusEnum = pgEnum("firm_status", ["active", "acquired", "renamed"]);
 export const firmTypeEnum = pgEnum("firm_type", ["brokerage", "carrier", "mga", "other"]);
@@ -176,17 +179,71 @@ export const firmEvents = pgTable(
   (table) => [index("firm_events_firm_idx").on(table.firmId)],
 );
 
-export const candidates = pgTable("candidates", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  fullName: text("full_name").notNull(),
-  currentTitle: text("current_title"),
-  currentFirmRaw: text("current_firm_raw"),
-  resolvedFirmId: uuid("resolved_firm_id").references(() => firms.id),
-  linkedinUrl: text("linkedin_url"),
-  doNotContact: boolean("do_not_contact").notNull().default(false),
-  createdBy: uuid("created_by").references(() => users.id),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+export const candidateSourceEnum = pgEnum("candidate_source", [
+  "sourced",
+  "referral",
+  "inbound",
+  "migrated",
+]);
+
+// firm_resolution_method mirrors resolver.ts's ResolutionMethod, plus
+// "manual" for when a human picked the firm directly from the dropdown
+// instead of accepting (or in place of) the resolver's suggestion.
+export const firmResolutionMethodEnum = pgEnum("firm_resolution_method", [
+  "exact",
+  "alias",
+  "fuzzy",
+  "manual",
+]);
+
+// Phase 3 fields beyond the MVP cut. Deliberately still missing
+// eligibility_status/eligibility_reason from the full spec 5 table -- those
+// require the Phase 8 eligibility engine (Top 100 + off-limits gate) to
+// mean anything; adding empty columns for a computation that doesn't exist
+// yet would be a misleading placeholder, not a head start.
+export const candidates = pgTable(
+  "candidates",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    fullName: text("full_name").notNull(),
+    preferredName: text("preferred_name"),
+    currentTitle: text("current_title"),
+    currentFirmRaw: text("current_firm_raw"),
+    resolvedFirmId: uuid("resolved_firm_id").references(() => firms.id),
+    // Populated by src/firms/resolver.ts (resolveFirm()) on create/edit when
+    // resolvedFirmId wasn't picked by hand -- "manual" + 1.0 when it was.
+    // Null resolvedFirmId with a non-null method means the resolver ran but
+    // requiresManualConfirmation() was true, so nothing was auto-applied.
+    firmResolutionConfidence: doublePrecision("firm_resolution_confidence"),
+    firmResolutionMethod: firmResolutionMethodEnum("firm_resolution_method"),
+    specialty: text("specialty"),
+    location: text("location"),
+    timezone: text("timezone"),
+    seniority: text("seniority"),
+    linkedinUrl: text("linkedin_url"),
+    source: candidateSourceEnum("source").notNull().default("sourced"),
+    summary: text("summary"),
+    doNotContact: boolean("do_not_contact").notNull().default(false),
+    dncReason: text("dnc_reason"),
+    dncSetAt: timestamp("dnc_set_at", { withTimezone: true }),
+    // Soft merge (spec 3.6: "Merges and deletions are soft and reversible
+    // for 90 days"). A non-null value means this row is the "loser" of a
+    // merge; its own data stays intact for the reversibility window rather
+    // than being deleted or overwritten.
+    mergedIntoId: uuid("merged_into_id").references((): AnyPgColumn => candidates.id),
+    createdBy: uuid("created_by").references(() => users.id),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    // search_vector (tsvector, spec 5) is deliberately NOT modeled here.
+    // It's a Postgres GENERATED ALWAYS AS ... STORED column maintained
+    // entirely by the database (migrations/0005) -- application code never
+    // writes it and only ever reads through it via the raw
+    // websearch_to_tsquery() match in listCandidates() (src/candidates/
+    // queries.ts), so there's no drizzle-orm column type for it to get
+    // right or wrong.
+  },
+  (table) => [index("candidates_merged_into_idx").on(table.mergedIntoId)],
+);
 
 export const claimStatusEnum = pgEnum("claim_status", ["active", "released"]);
 export const claimBasisEnum = pgEnum("claim_basis", ["first_touch", "manual_override"]);
@@ -237,3 +294,116 @@ export const contactLedger = pgTable("contact_ledger", {
 });
 
 export const GLOBAL_CONTACT_COOLDOWN_DAYS = 90;
+
+// --- Phase 3: engagements, documents, activities ---------------------------
+
+export const engagementTypeEnum = pgEnum("engagement_type", ["retained", "contingent", "consulting"]);
+export const engagementStatusEnum = pgEnum("engagement_status", ["active", "completed", "lapsed"]);
+export const offLimitsScopeEnum = pgEnum("off_limits_scope", [
+  "firm_wide",
+  "division",
+  "named_individuals",
+  "none",
+]);
+
+// Client engagements (spec 5, "Firms and clients"). This is the record only
+// -- Phase 3 scope is "firm and engagement records," not the enforcement
+// gate. off_limits_scope/off_limits_expires_at are captured here now
+// because they're just data about the engagement, but nothing yet reads
+// them to actually block a claim or a send: that gate (spec 8.1,
+// "candidates at this firm are off-limits because of this engagement") is
+// explicitly Phase 5 work. Wiring it in early would mean guessing at how
+// Phase 5's eligibility pipeline wants to consume it.
+export const engagements = pgTable("engagements", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  firmId: uuid("firm_id")
+    .notNull()
+    .references(() => firms.id),
+  engagementType: engagementTypeEnum("engagement_type").notNull().default("retained"),
+  status: engagementStatusEnum("status").notNull().default("active"),
+  startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
+  endedAt: timestamp("ended_at", { withTimezone: true }),
+  offLimitsScope: offLimitsScopeEnum("off_limits_scope").notNull().default("firm_wide"),
+  offLimitsExpiresAt: timestamp("off_limits_expires_at", { withTimezone: true }),
+  termsNotes: text("terms_notes"),
+  createdBy: uuid("created_by").references(() => users.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const documentTypeEnum = pgEnum("document_type", ["resume", "attachment", "note_file"]);
+export const documentParseStatusEnum = pgEnum("document_parse_status", [
+  "pending",
+  "parsed",
+  "failed",
+  "not_applicable",
+]);
+
+// Spec 3.7 + 5: "Documents in S3-compatible storage... Never on the app
+// filesystem." Phase 3 scope is upload and view only -- parseStatus stays
+// "pending" (or "not_applicable" for non-resume attachments) until Phase 7
+// wires up actual text extraction. extractedText is nullable and unused
+// until then; the column exists now because it's part of the one documents
+// table the spec defines, not because anything populates it yet.
+export const documents = pgTable(
+  "documents",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    candidateId: uuid("candidate_id")
+      .notNull()
+      .references(() => candidates.id),
+    docType: documentTypeEnum("doc_type").notNull(),
+    storageKey: text("storage_key").notNull(),
+    filename: text("filename").notNull(),
+    mimeType: text("mime_type").notNull(),
+    sizeBytes: integer("size_bytes").notNull(),
+    checksumSha256: text("checksum_sha256").notNull(),
+    version: integer("version").notNull().default(1),
+    parsedAt: timestamp("parsed_at", { withTimezone: true }),
+    parseStatus: documentParseStatusEnum("parse_status").notNull().default("pending"),
+    extractedText: text("extracted_text"),
+    uploadedBy: uuid("uploaded_by").references(() => users.id),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("documents_candidate_idx").on(table.candidateId)],
+);
+
+export const activityTypeEnum = pgEnum("activity_type", [
+  "call",
+  "note",
+  "meeting",
+  "email",
+  "linkedin",
+  "stage_change",
+  "system",
+]);
+export const activityDirectionEnum = pgEnum("activity_direction", ["inbound", "outbound"]);
+
+// The unified timeline (spec 5: "activities... calls, notes, meetings,
+// emails, messages, all on one timeline"). Distinct from contact_ledger:
+// contact_ledger is the lean collision-check table (candidate_id, user_id,
+// channel, occurred_at -- just enough to answer "did anyone touch this
+// person recently"), activities is the rich human-readable record with a
+// subject/body. Logging a contact writes both (see
+// src/candidates/actions.ts) rather than trying to derive one from the
+// other. searchId/emailThreadId/providerMessageId stay null until Phases
+// 4 and 6 exist to populate them.
+export const activities = pgTable(
+  "activities",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    candidateId: uuid("candidate_id")
+      .notNull()
+      .references(() => candidates.id),
+    searchId: uuid("search_id"), // FK added once `searches` exists (Phase 4)
+    userId: uuid("user_id").references(() => users.id),
+    activityType: activityTypeEnum("activity_type").notNull(),
+    direction: activityDirectionEnum("direction"),
+    occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull().defaultNow(),
+    subject: text("subject"),
+    body: text("body"),
+    emailThreadId: text("email_thread_id"),
+    providerMessageId: text("provider_message_id"),
+    isAutoCaptured: boolean("is_auto_captured").notNull().default(false),
+  },
+  (table) => [index("activities_candidate_occurred_idx").on(table.candidateId, table.occurredAt)],
+);

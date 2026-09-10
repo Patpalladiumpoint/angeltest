@@ -2,22 +2,63 @@ import Link from "next/link";
 import { redirect } from "next/navigation";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/auth/config";
-import { listCandidates, listFirms } from "@/candidates/queries";
+import { listCandidates, listCandidateFacets, listFirms } from "@/candidates/queries";
 import { createCandidateAction } from "@/candidates/actions";
 
-// Everyone sees every candidate, owner and last-contact included -- that
-// visibility is the point (spec 8.2: "The candidate page shows current
-// owner, claim basis, expiry, and the full contact ledger... Everyone sees
-// everything.").
-export default async function CandidatesPage() {
+// Full-text (spec section 4: "Postgres full-text search (tsvector)") plus
+// faceted filtering by specialty/location (spec Phase 3: "full-text and
+// faceted search"). Filters are plain URL search params, not client state
+// -- a search is a URL you can bookmark or hand to a teammate, matching how
+// the rest of this app avoids client-side state where a server round trip
+// is cheap enough (five users, moderate volume -- see spec section 4,
+// "Keep it boring").
+export default async function CandidatesPage({
+  searchParams,
+}: {
+  searchParams: { q?: string; specialty?: string; location?: string };
+}) {
   const session = await getServerSession(authOptions);
   if (!session) redirect("/sign-in");
 
-  const [candidates, firms] = await Promise.all([listCandidates(), listFirms()]);
+  const filters = {
+    query: searchParams.q,
+    specialty: searchParams.specialty,
+    location: searchParams.location,
+  };
+
+  const [candidateList, facets, firms] = await Promise.all([
+    listCandidates(filters),
+    listCandidateFacets(),
+    listFirms(),
+  ]);
+
+  const hasFilters = Boolean(filters.query || filters.specialty || filters.location);
 
   return (
     <main>
       <h1>Candidates</h1>
+
+      <form>
+        <input type="search" name="q" placeholder="Search name, title, specialty..." defaultValue={filters.query ?? ""} />
+        <select name="specialty" defaultValue={filters.specialty ?? ""}>
+          <option value="">All specialties</option>
+          {facets.specialties.map((s) => (
+            <option key={s} value={s}>
+              {s}
+            </option>
+          ))}
+        </select>
+        <select name="location" defaultValue={filters.location ?? ""}>
+          <option value="">All locations</option>
+          {facets.locations.map((l) => (
+            <option key={l} value={l}>
+              {l}
+            </option>
+          ))}
+        </select>
+        <button type="submit">Search</button>
+        {hasFilters && <Link href="/candidates">Clear</Link>}
+      </form>
 
       <table>
         <thead>
@@ -25,12 +66,14 @@ export default async function CandidatesPage() {
             <th>Name</th>
             <th>Title</th>
             <th>Firm</th>
+            <th>Specialty</th>
+            <th>Location</th>
             <th>Owner</th>
             <th>Last contact</th>
           </tr>
         </thead>
         <tbody>
-          {candidates.map((c) => (
+          {candidateList.map((c) => (
             <tr key={c.id}>
               <td>
                 <Link href={`/candidates/${c.id}`}>{c.fullName}</Link>
@@ -38,13 +81,15 @@ export default async function CandidatesPage() {
               </td>
               <td>{c.currentTitle ?? "—"}</td>
               <td>{c.firmName ?? "—"}</td>
+              <td>{c.specialty ?? "—"}</td>
+              <td>{c.location ?? "—"}</td>
               <td>{c.ownerEmail ?? "Unclaimed"}</td>
               <td>{c.lastContactAt ? c.lastContactAt.toLocaleDateString() : "Never"}</td>
             </tr>
           ))}
-          {candidates.length === 0 && (
+          {candidateList.length === 0 && (
             <tr>
-              <td colSpan={5}>No candidates yet.</td>
+              <td colSpan={7}>{hasFilters ? "No candidates match this search." : "No candidates yet."}</td>
             </tr>
           )}
         </tbody>
@@ -64,20 +109,31 @@ export default async function CandidatesPage() {
         </div>
         <div>
           <label>
-            Current firm (free text) <input name="currentFirmRaw" />
+            Current firm (free text — the resolver will try to match it automatically)
+            <input name="currentFirmRaw" />
           </label>
         </div>
         <div>
           <label>
-            Resolved firm
+            Resolved firm (optional — overrides the resolver)
             <select name="resolvedFirmId" defaultValue="">
-              <option value="">— none —</option>
+              <option value="">— let the resolver decide —</option>
               {firms.map((f) => (
                 <option key={f.id} value={f.id}>
                   {f.canonicalName}
                 </option>
               ))}
             </select>
+          </label>
+        </div>
+        <div>
+          <label>
+            Specialty <input name="specialty" />
+          </label>
+        </div>
+        <div>
+          <label>
+            Location <input name="location" />
           </label>
         </div>
         <div>

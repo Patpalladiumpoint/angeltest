@@ -5,7 +5,14 @@ five-recruiter executive search desk covering the Business Insurance Top 100
 Brokers. Full spec: see the project brief this repo was built from (build
 order, data model, and guardrails).
 
-## Status: Phase 0 (Foundation and custody) + an MVP slice + Phase 1 (Firm graph)
+## Status: Phase 0 (Foundation and custody) + an MVP slice + Phase 1 (Firm graph) + Phase 3 (Core records UI)
+
+Phase 2 (migration from Crelate) is deliberately skipped for now: the spec
+marks it **blocking** on verifying Crelate's export API actually supports
+pulling resumes, attachments, and full activity history (spec 7.1, OQ 3),
+which needs real Crelate access/credentials this environment doesn't have.
+Building Phase 3 on top of a live system's records (once the resolver was
+solid) was the more useful next step than guessing at Phase 2.
 
 Per the spec's build order, phases ship in sequence and each is
 independently demoable. **This repo currently implements Phase 0 only:**
@@ -183,6 +190,86 @@ succeeds or fails quietly. Do not rush it." It's implemented per spec 7.3:
   non-exhaustive set — there's no canonical dictionary to verify it
   against, unlike the legal-suffix list the spec gives verbatim.
 
+## Phase 3: core records UI
+
+Spec build order: "Candidate CRUD, merge and unmerge, activity timeline,
+document upload and view, firm and engagement records, full-text and
+faceted search. Deploy this. The team can work out of it while the rest is
+built." All of that is here except migration-scale dedupe (Phase 2) and the
+actual off-limits/eligibility gate (Phase 5, see below).
+
+- **Candidate CRUD** — `/candidates` (list, search, quick-add) and
+  `/candidates/[id]` (full edit form: name, title, firm, specialty,
+  location, seniority, LinkedIn, summary).
+- **The Phase 1 resolver is now wired into candidate create/edit** (this
+  was flagged as a Phase 3 task in the Phase 1 notes above, and is done
+  now): typing a firm as free text runs `resolveFirm()` server-side. A
+  human-picked firm is trusted outright (`manual`, confidence 1.0);
+  otherwise the resolver's result is only auto-applied when it clears the
+  spec 8.1 confidence bar (`requiresManualConfirmation()`). When it
+  doesn't, the candidate page shows the live suggestion inline ("Possible
+  firm match: X (fuzzy), needs confirmation") rather than silently leaving
+  the field blank.
+- **Merge and unmerge** — `mergeCandidatesAction`/`unmergeCandidatesAction`
+  in `src/candidates/actions.ts`. True to spec 3.6 ("soft and reversible for
+  90 days"): nothing is deleted or physically moved. A merged record keeps
+  its own row and its own activity history; `getCandidateDetail()` folds a
+  merged-in record's timeline into the survivor's by querying both, so
+  unmerge is just clearing one column, not reconstructing lost data. The
+  one real edge case here — **both records having an active claim by
+  different recruiters at merge time** — was tested directly against
+  Postgres: the winner's claim is kept, the loser's is released (not
+  dropped silently), and the collision is named in the audit log reason.
+  If only the loser had a claim, it's carried over to the winner instead of
+  being lost.
+- **Unified activity timeline** — a real `activities` table (spec 5)
+  alongside the MVP's lean `contact_ledger`: logging a contact writes both
+  (contact_ledger for the 90-day collision check, activities for the
+  human-readable record with a subject/body). A separate "log other
+  activity" form covers notes/calls/meetings that *aren't* new outbound
+  touches (e.g. writing up a call the candidate initiated) and correctly
+  does not run through the collision gate — recording history isn't the
+  same as initiating contact.
+- **Document upload and view** — `/candidates/[id]` uploads to the
+  documents S3 bucket built in Phase 0 (`putObject`/`getObjectBuffer`,
+  reused as-is) with a computed SHA-256 checksum, and a download route that
+  streams the object back through the app rather than adding
+  `@aws-sdk/s3-request-presigner` as a new dependency just for this.
+  `parse_status` stays `pending`/`not_applicable` — actual text extraction
+  is Phase 7, not started here.
+- **Firm records** — `/firms/[id]` shows a firm's aliases, its full M&A
+  history in both directions (as the acquired party *and* as the acquirer —
+  verified against Postgres that Gallagher's page shows the Woodruff Sawyer
+  acquisition exactly like Woodruff Sawyer's page does), its parent chain,
+  and every candidate currently resolved to it.
+- **Engagement records** — a bare `engagements` table and create form tied
+  to a firm, capturing `off_limits_scope`/`off_limits_expires_at` as data.
+  **Nothing reads these fields yet to actually block a claim or a send** —
+  that gate is explicitly Phase 5 ("off-limits derived from engagements").
+  Wiring it in now would mean guessing at how Phase 5's eligibility
+  pipeline wants to consume it; recording the data now and gating on it
+  later is the honest sequencing.
+- **Full-text and faceted search** — `candidates.search_vector` is a
+  Postgres `GENERATED ALWAYS AS ... STORED` `tsvector` column (weighted:
+  name > title/specialty/firm > location/seniority > summary), not a
+  trigger — it can't drift out of sync with an edit that forgets to fire
+  one. `/candidates` combines a `websearch_to_tsquery` search box with
+  specialty/location facet dropdowns as plain URL search params (a search
+  is a bookmarkable/shareable URL, not client state). Verified directly
+  against Postgres: correct ranking, no false positives on unrelated terms,
+  and correct results when combining a text query with a facet filter.
+
+### What's still deferred
+
+- No migration-scale dedupe (email-first, then name+firm, then fuzzy
+  name+LinkedIn per spec 7.2) — the merge UI here only surfaces exact
+  full-name matches, enough to use by hand today, not the real Phase 2
+  pipeline.
+- No off-limits/eligibility gate consuming `engagements` — Phase 5.
+- No resume text extraction — Phase 7. Documents upload and store; nothing
+  reads `extracted_text` yet.
+- `searches`/`search_id` on `activities` stay unwired until Phase 4.
+
 ## Why hand-written SQL migrations
 
 Migrations live as plain `.sql` files in `src/db/migrations/`, applied by a
@@ -276,6 +363,13 @@ Postgres 16 instance with `psql`, `pg_dump`, and `pg_restore`:
   acceptance-criteria examples (Woodruff Sawyer → Gallagher, Accession →
   Risk Strategies) and the seed script's idempotency (re-running produces
   identical row counts).
+- Phase 3's full migration chain (all 5 files) was applied to a fresh
+  database and re-applied on top of itself with zero errors either time.
+  The generated `search_vector` column, the combined text+facet search
+  query, the firm-events self-join in both directions, and the merge
+  claim-collision logic (both records having an active claim by different
+  recruiters) were each proven with real data and real queries against
+  Postgres — not just read for logical consistency.
 
 What was **not** run in this session: `npm install`, `next build`, `tsc`
 against the real dependency graph, or `vitest` itself, since none of those
