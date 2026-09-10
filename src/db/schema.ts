@@ -6,8 +6,11 @@ import {
   boolean,
   jsonb,
   integer,
+  bigint,
   pgEnum,
   uniqueIndex,
+  index,
+  type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
@@ -85,17 +88,93 @@ export const SYSTEM_SETTINGS_SINGLETON_ID = 1;
 // README "MVP scope" for exactly what this does and does not enforce yet.
 
 export const firmStatusEnum = pgEnum("firm_status", ["active", "acquired", "renamed"]);
+export const firmTypeEnum = pgEnum("firm_type", ["brokerage", "carrier", "mga", "other"]);
 
-// A trimmed stand-in for the full spec 5 `firms` table (no aliases, no
-// firm_events, no parent-firm chain). Good enough to attach a candidate to
-// a firm by name; not good enough to run the real fuzzy resolver (Phase 1).
-export const firms = pgTable("firms", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  canonicalName: text("canonical_name").notNull(),
-  top100Rank: integer("top100_rank"),
-  status: firmStatusEnum("status").notNull().default("active"),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+// Phase 1 (spec section 5, "Firms and clients" / section 7.3 resolver).
+// canonicalName is the resolver's exact-match target; parentFirmId lets an
+// acquired firm's eligibility roll up to its acquirer without maintaining a
+// separate table by hand (spec: "Placement protection is derived too...
+// Compute it, do not maintain it by hand" -- same philosophy applies here).
+export const firms = pgTable(
+  "firms",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    canonicalName: text("canonical_name").notNull(),
+    // Maintained by application code (normalizeEmployerString() in
+    // src/firms/resolver.ts) on every insert/update, mirroring how
+    // firm_aliases.normalized_alias is populated. The resolver's exact and
+    // fuzzy tiers both compare against this, not the raw canonicalName --
+    // spec 7.3 step 2a is explicit that the exact match is "on
+    // firms.canonical_name normalized."
+    normalizedCanonicalName: text("normalized_canonical_name"),
+    top100Rank: integer("top100_rank"),
+    top100ListYear: integer("top100_list_year"),
+    // Reporting figure from the Top 100 list, in whole US dollars. Not part
+    // of the spec 3.8 money-integrity guardrail (that's specifically
+    // invoices/commissions/placements) -- this is informational data about
+    // a firm, not a transaction, so it deliberately doesn't use the Cents
+    // branded type.
+    usBrokerageRevenueDollars: bigint("us_brokerage_revenue_dollars", { mode: "number" }),
+    status: firmStatusEnum("status").notNull().default("active"),
+    firmType: firmTypeEnum("firm_type").notNull().default("brokerage"),
+    parentFirmId: uuid("parent_firm_id").references((): AnyPgColumn => firms.id),
+    website: text("website"),
+    notes: text("notes"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("firms_normalized_name_unique_idx")
+      .on(table.normalizedCanonicalName)
+      .where(sql`${table.normalizedCanonicalName} IS NOT NULL`),
+  ],
+);
+
+export const firmAliasTypeEnum = pgEnum("firm_alias_type", [
+  "dba",
+  "former_name",
+  "abbreviation",
+  "misspelling",
+]);
+
+// The resolver's second-tier match (spec 7.3 step 2b, confidence 0.95).
+// normalizedAlias is precomputed at seed/insert time by the same
+// normalizeEmployerString() the resolver runs on incoming strings, so the
+// comparison is normalized-to-normalized, not normalized-to-raw.
+export const firmAliases = pgTable(
+  "firm_aliases",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    firmId: uuid("firm_id")
+      .notNull()
+      .references(() => firms.id),
+    alias: text("alias").notNull(),
+    aliasType: firmAliasTypeEnum("alias_type").notNull(),
+    normalizedAlias: text("normalized_alias").notNull(),
+  },
+  (table) => [uniqueIndex("firm_aliases_normalized_unique_idx").on(table.normalizedAlias)],
+);
+
+export const firmEventTypeEnum = pgEnum("firm_event_type", ["acquired_by", "renamed", "merged"]);
+
+// M&A/rebrand history (spec 7.3 step 3, "walk firm_events for acquisitions
+// and rebrands"). counterpartyFirmId is the acquirer/new-name firm; the
+// resolver walks acquired_by edges to the current owner and applies the
+// OQ 2 eligibility-transition rule against announcedAt/effectiveAt.
+export const firmEvents = pgTable(
+  "firm_events",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    firmId: uuid("firm_id")
+      .notNull()
+      .references(() => firms.id),
+    eventType: firmEventTypeEnum("event_type").notNull(),
+    counterpartyFirmId: uuid("counterparty_firm_id").references(() => firms.id),
+    announcedAt: timestamp("announced_at", { withTimezone: true }),
+    effectiveAt: timestamp("effective_at", { withTimezone: true }),
+    sourceUrl: text("source_url"),
+  },
+  (table) => [index("firm_events_firm_idx").on(table.firmId)],
+);
 
 export const candidates = pgTable("candidates", {
   id: uuid("id").primaryKey().defaultRandom(),

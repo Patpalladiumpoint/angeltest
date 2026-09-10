@@ -17,6 +17,7 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx src/db/migrate.ts",
     "db:seed": "tsx src/db/seed.ts",
+    "db:seed-firms": "tsx src/db/seedFirms.ts",
     "backup:run": "tsx src/custody/backup.ts",
     "backup:restore-drill": "tsx src/custody/restoreDrill.ts",
     "export:run": "tsx src/custody/export.ts"
